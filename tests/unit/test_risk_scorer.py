@@ -22,8 +22,10 @@ def _arg(gene: str = "blaTEM-1", drug_class: str = "beta-lactam") -> ARGHit:
     return ARGHit(
         contig_id="test",
         gene_name=gene,
+        aro_accession="ARO:3000001",
         amr_family="TEM",
         drug_class=drug_class,
+        resistance_mechanism="antibiotic inactivation",
         identity=99.0,
         coverage=100.0,
         evalue=1e-50,
