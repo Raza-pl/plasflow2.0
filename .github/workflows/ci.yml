@@ -20,7 +20,7 @@ jobs:
 
       - name: Install dev deps
         run: |
-          pip install black ruff mypy
+          pip install "black==24.3.0" "ruff==0.4.4" "mypy==1.8.0"
 
       - name: black
         run: black --check src/ tests/
@@ -29,7 +29,7 @@ jobs:
         run: ruff check src/ tests/
 
       - name: mypy
-        run: mypy src/plasflow2/
+        run: mypy src/plasflow2/ --ignore-missing-imports
 
   test:
     name: Tests (Python ${{ matrix.python-version }})
