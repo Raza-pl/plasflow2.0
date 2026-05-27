@@ -10,10 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import torch
 
 from plasflow2.classify.features import extract_features
-from plasflow2.classify.model import load_model
 from plasflow2.utils.device import IDX_TO_CLASS, get_device
 
 logger = logging.getLogger(__name__)
@@ -56,6 +54,10 @@ def predict(
         - Implement MC dropout (10 passes) for uncertainty estimation.
         - Add RF ensemble member predictions.
     """
+    import torch
+
+    from plasflow2.classify.model import load_model
+
     device = get_device()
     model = load_model(model_path, device=device)
 
