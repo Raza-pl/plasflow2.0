@@ -24,6 +24,7 @@ def train_rf(X_train, y_train, n_estimators: int = 500):
     TODO (Day 10): implement full training with cross-validation.
     """
     from sklearn.ensemble import RandomForestClassifier  # type: ignore[import]
+
     rf = RandomForestClassifier(
         n_estimators=n_estimators,
         max_features="sqrt",
@@ -40,18 +41,18 @@ def train_mlp(X_train, y_train, epochs: int = 50, batch_size: int = 512, lr: flo
     TODO (Day 11): implement training loop with AdamW + cosine LR.
     """
     import torch
-    from torch.utils.data import DataLoader, TensorDataset
-
-    from plasflow2.classify.model import PlasFlowMLP, save_model
+    from plasflow2.classify.model import PlasFlowMLP
     from plasflow2.utils.device import get_device
+    from torch.utils.data import DataLoader, TensorDataset
 
     device = get_device()
     model = PlasFlowMLP(input_dim=X_train.shape[1]).to(device)
 
     X_t = torch.tensor(X_train).float()
     y_t = torch.tensor(y_train).long()
-    loader = DataLoader(TensorDataset(X_t, y_t), batch_size=batch_size, shuffle=True,
-                        num_workers=0)  # num_workers=0 required for MPS
+    loader = DataLoader(
+        TensorDataset(X_t, y_t), batch_size=batch_size, shuffle=True, num_workers=0
+    )  # num_workers=0 required for MPS
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -77,11 +78,11 @@ def train_mlp(X_train, y_train, epochs: int = 50, batch_size: int = 512, lr: flo
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Train PlasFlow v2 models")
-    parser.add_argument("--data",   required=True, help="Feature matrix (.npy)")
+    parser.add_argument("--data", required=True, help="Feature matrix (.npy)")
     parser.add_argument("--labels", required=True, help="Labels array (.npy)")
-    parser.add_argument("--out",    default="data/models", help="Output directory")
-    parser.add_argument("--rf",     action="store_true", help="Train Random Forest")
-    parser.add_argument("--mlp",    action="store_true", help="Train MLP")
+    parser.add_argument("--out", default="data/models", help="Output directory")
+    parser.add_argument("--rf", action="store_true", help="Train Random Forest")
+    parser.add_argument("--mlp", action="store_true", help="Train MLP")
     parser.add_argument("--epochs", type=int, default=50)
     args = parser.parse_args()
 
@@ -103,6 +104,7 @@ def main() -> None:
     if args.mlp:
         logger.info("Training MLP …")
         from plasflow2.classify.model import save_model
+
         model = train_mlp(X, y, epochs=args.epochs)
         save_model(model, out_dir / "mlp_v2.pt")
 
