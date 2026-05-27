@@ -48,6 +48,36 @@ Classified in ~7 minutes on Apple M1 (MPS). Unclassified contigs are those where
 
 ## Installation
 
+### Docker (zero-setup)
+
+```bash
+# Build the image
+docker build -t plasflow2 .
+
+# Classify only (no databases required)
+docker run --rm \
+  -v /path/to/input:/data/input:ro \
+  -v /path/to/results:/results \
+  plasflow2 classify \
+    --input  /data/input/assembly.fasta \
+    --output /results/predictions.tsv
+
+# Full pipeline with CARD + GTDB databases mounted
+docker run --rm \
+  -v /path/to/databases:/data/databases:ro \
+  -v /path/to/input:/data/input:ro \
+  -v /path/to/results:/results \
+  plasflow2 run \
+    --input   /data/input/assembly.fasta \
+    --output  /results/ \
+    --card-db /data/databases/card/card.dmnd \
+    --aro-index /data/databases/card/aro_index.tsv \
+    --threads 8
+
+# Or with docker-compose (edit PLASFLOW_* env vars to set paths)
+docker compose run plasflow2
+```
+
 ### From source (recommended during alpha)
 
 ```bash
@@ -284,6 +314,16 @@ python scripts/download_metagenome.py \
   --taxon wastewater \
   --min-size 150 \
   --outdir data/test/
+
+# Download 1,000 diverse RefSeq chromosomes to retrain the classifier
+# (balanced across 14 bacterial phyla via NCBI taxonomy ID search)
+python scripts/download_refseq_chromosomes.py --outdir data/chromosomes/
+# Smaller run for quick testing
+python scripts/download_refseq_chromosomes.py --count 200 --outdir data/chromosomes/
+# Dry run first to see what would be fetched
+python scripts/download_refseq_chromosomes.py --dry-run --count 100
+# Single phylum only
+python scripts/download_refseq_chromosomes.py --phylum Pseudomonadota --count 100 --outdir data/chromosomes/
 ```
 
 ### Test structure
@@ -311,9 +351,9 @@ tests/
 ## Roadmap
 
 - [x] Taxonomy annotation per contig (DIAMOND + GTDB LCA, Kaiju-style)
-- [ ] Expanded chromosomal training data (100+ species across major phyla)
-- [ ] Drug-class co-occurrence heatmap across plasmid contigs (in report)
-- [ ] Docker image for zero-setup deployment
+- [x] Drug-class co-occurrence heatmap across plasmid contigs (in report)
+- [x] Docker image for zero-setup deployment
+- [ ] Expanded chromosomal training data (1,000 species across 14 phyla — `scripts/download_refseq_chromosomes.py --count 1000`)
 - [ ] Snakemake / Nextflow workflow wrapper for batch processing
 - [ ] PyPI release
 

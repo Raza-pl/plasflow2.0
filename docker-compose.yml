@@ -1,0 +1,38 @@
+services:
+  plasflow2:
+    image: plasflow2:latest
+    build:
+      context: .
+      target: runtime
+    volumes:
+      # Mount your databases directory (read-only)
+      - ${PLASFLOW_DB_DIR:-./data/databases}:/data/databases:ro
+      # Mount your input FASTA directory (read-only)
+      - ${PLASFLOW_INPUT_DIR:-./data/input}:/data/input:ro
+      # Mount your results directory (read-write)
+      - ${PLASFLOW_RESULTS_DIR:-./results}:/results:rw
+    # Override the default command to run a full pipeline.
+    # Edit this or pass arguments via `docker compose run plasflow2 ...`
+    command: >
+      run
+      --input   /data/input/assembly.fasta
+      --output  /results/
+      --card-db /data/databases/card/card.dmnd
+      --aro-index /data/databases/card/aro_index.tsv
+      --context wastewater
+      --threads 8
+      --skip-taxonomy
+
+  # Convenience service: just classify, no external databases required
+  classify:
+    image: plasflow2:latest
+    build:
+      context: .
+      target: runtime
+    volumes:
+      - ${PLASFLOW_INPUT_DIR:-./data/input}:/data/input:ro
+      - ${PLASFLOW_RESULTS_DIR:-./results}:/results:rw
+    command: >
+      classify
+      --input  /data/input/assembly.fasta
+      --output /results/predictions.tsv

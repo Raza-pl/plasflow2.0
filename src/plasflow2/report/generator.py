@@ -1,6 +1,6 @@
 """HTML report generator.
 
-Week 4 — Days 20 + 26 implementation.
+Week 4 — Days 20 + 26 + 27 implementation.
 
 Produces a single self-contained HTML file with:
   - Summary stats panel
@@ -8,6 +8,7 @@ Produces a single self-contained HTML file with:
   - ARG bar chart per drug class (Plotly)
   - AMR risk score histogram (Plotly)
   - Contig length vs risk score scatter plot (Plotly)
+  - Drug-class co-occurrence heatmap (Plotly)
   - Per-plasmid detail table with sortable columns (DataTables.js via CDN)
   - Risk-tier filter buttons (high / medium / low / all)
   - Taxonomy column (LCA result from DIAMOND + GTDB)
@@ -106,6 +107,15 @@ _TEMPLATE = """<!DOCTYPE html>
   </div>
   {% endif %}
 
+  {% if has_cooccurrence %}
+  <h2>Drug-Class Co-occurrence</h2>
+  <p style="color:#666;font-size:.88rem;margin:-8px 0 12px;">
+    Each cell shows how many plasmid contigs carry both drug classes simultaneously.
+    Darker = more co-occurrence. Only contigs with ≥2 drug classes are included.
+  </p>
+  <div id="cooccurrence-chart" class="chart-box" style="min-height:420px;"></div>
+  {% endif %}
+
   <h2>Plasmid Detail</h2>
   <div class="filter-bar">
     <span style="font-size:.85rem;color:#555;">Filter by risk tier:</span>
@@ -172,6 +182,11 @@ _TEMPLATE = """<!DOCTYPE html>
 
     var taxData = {{ tax_bar_data | tojson }};
     Plotly.newPlot('tax-chart', taxData.data, taxData.layout, {responsive: true});
+    {% endif %}
+
+    {% if has_cooccurrence %}
+    var coData = {{ cooccurrence_data | tojson }};
+    Plotly.newPlot('cooccurrence-chart', coData.data, coData.layout, {responsive: true});
     {% endif %}
 
     // ---- DataTable ----
@@ -430,6 +445,106 @@ def _build_taxonomy_bar(plasmid_rows: list[PlasmidRow]) -> dict:
     }
 
 
+def _build_drug_cooccurrence_heatmap(plasmid_results: list) -> dict:
+    """Plotly heatmap: drug-class co-occurrence across plasmid contigs.
+
+    For every pair of drug classes (A, B), count how many distinct plasmid
+    contigs carry at least one ARG from each class simultaneously.  The matrix
+    is symmetric; diagonal cells show the total number of contigs carrying that
+    class at all.
+
+    Args:
+        plasmid_results: List of ContigResult objects from the pipeline.
+
+    Returns:
+        Plotly figure dict, or an empty placeholder if there are fewer than
+        2 drug classes present.
+    """
+    # Build per-contig drug-class sets
+    contig_classes: list[frozenset[str]] = []
+    for cr in plasmid_results:
+        classes: set[str] = set()
+        for hit in cr.arg_hits:
+            for dc in hit.drug_class.split(";"):
+                dc = dc.strip()
+                if dc and dc not in ("unknown", ""):
+                    classes.add(dc)
+        if classes:
+            contig_classes.append(frozenset(classes))
+
+    # Collect all unique drug classes (sorted for stable axis order)
+    all_classes = sorted({dc for classes in contig_classes for dc in classes})
+
+    if len(all_classes) < 2:
+        return {
+            "data": [],
+            "layout": {
+                "title": {
+                    "text": "Drug-Class Co-occurrence (insufficient data)",
+                    "font": {"size": 14},
+                },
+                "paper_bgcolor": "rgba(0,0,0,0)",
+                "plot_bgcolor": "rgba(0,0,0,0)",
+            },
+        }
+
+    n = len(all_classes)
+    # Build n×n count matrix
+    matrix = [[0] * n for _ in range(n)]
+    for fset in contig_classes:
+        for i, ci in enumerate(all_classes):
+            if ci not in fset:
+                continue
+            for j, cj in enumerate(all_classes):
+                if cj in fset:
+                    matrix[i][j] += 1
+
+    # Shorten long drug-class names for axis labels
+    def _short(label: str, maxlen: int = 28) -> str:
+        return label if len(label) <= maxlen else label[: maxlen - 1] + "…"
+
+    short_labels = [_short(c) for c in all_classes]
+
+    # Custom hover text: "X ∩ Y: N contigs"
+    hover = [
+        [f"{all_classes[i]}<br>∩ {all_classes[j]}<br>{matrix[i][j]} contig(s)" for j in range(n)]
+        for i in range(n)
+    ]
+
+    return {
+        "data": [
+            {
+                "type": "heatmap",
+                "z": matrix,
+                "x": short_labels,
+                "y": short_labels,
+                "text": hover,
+                "hovertemplate": "%{text}<extra></extra>",
+                "colorscale": "Blues",
+                "showscale": True,
+                "colorbar": {"title": "Contigs", "thickness": 14},
+            }
+        ],
+        "layout": {
+            "title": {"text": "Drug-Class Co-occurrence (plasmid contigs)", "font": {"size": 14}},
+            "xaxis": {
+                "title": "",
+                "tickangle": -40,
+                "tickfont": {"size": 10},
+                "automargin": True,
+            },
+            "yaxis": {
+                "title": "",
+                "tickfont": {"size": 10},
+                "automargin": True,
+            },
+            "margin": {"t": 60, "b": 120, "l": 160, "r": 40},
+            "paper_bgcolor": "rgba(0,0,0,0)",
+            "plot_bgcolor": "rgba(0,0,0,0)",
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main builder
 # ---------------------------------------------------------------------------
@@ -484,6 +599,15 @@ def build_report_data(pipeline_result, input_file: str = "") -> dict:
     tax_classified = sum(1 for r in taxonomy.values() if r.rank != "unclassified")
     has_scatter = len(plasmid_rows) > 0
 
+    # Drug-class co-occurrence — needs raw ContigResult objects (with .arg_hits)
+    cooccurrence_data = _build_drug_cooccurrence_heatmap(pipeline_result.plasmid_results)
+    # Show heatmap only when at least 2 distinct drug classes are present
+    has_cooccurrence = (
+        bool(cooccurrence_data.get("data"))
+        and len(cooccurrence_data["data"]) > 0
+        and cooccurrence_data["data"][0].get("z", [])
+    )
+
     return {
         "input_file": input_file or str(pipeline_result.input_fasta),
         "total": pipeline_result.total_sequences,
@@ -496,8 +620,10 @@ def build_report_data(pipeline_result, input_file: str = "") -> dict:
         "risk_data": _build_risk_histogram(risk_scores),
         "scatter_data": _build_scatter_data(plasmid_rows) if has_scatter else {},
         "tax_bar_data": _build_taxonomy_bar(plasmid_rows) if has_scatter else {},
+        "cooccurrence_data": cooccurrence_data,
         "plasmid_rows": plasmid_rows,
         "has_scatter": has_scatter,
+        "has_cooccurrence": has_cooccurrence,
     }
 
 
@@ -537,6 +663,7 @@ def generate_report(
                 "arg_data",
                 "risk_data",
                 "scatter_data",
+                "cooccurrence_data",
                 "tax_bar_data",
                 "plasmid_rows",
             )

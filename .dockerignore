@@ -1,0 +1,39 @@
+# Git
+.git
+.gitignore
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info
+dist/
+build/
+.venv/
+.mypy_cache/
+.ruff_cache/
+
+# Tests (not needed in image)
+tests/
+
+# Large data files (mounted as volumes at runtime)
+data/chromosomes/
+data/plasmids/
+data/phages/
+data/databases/
+data/test/
+
+# CI / dev config
+.github/
+.pre-commit-config.yaml
+.coverage
+htmlcov/
+
+# Scripts (not needed at runtime)
+scripts/
+
+# Docs
+*.md
+LICENSE
