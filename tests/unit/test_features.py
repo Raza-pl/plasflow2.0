@@ -46,3 +46,26 @@ def test_extract_features_different_seqs() -> None:
     """Different sequences should produce different feature vectors."""
     X = extract_features(["ACGT" * 100, "GGCC" * 100])
     assert not np.allclose(X[0], X[1]), "Expected distinct vectors for distinct sequences"
+
+
+def test_kmer_vector_rc_invariant() -> None:
+    """Reverse complement of a sequence should produce the same feature vector."""
+    from plasflow2.classify.features import _reverse_complement
+
+    seq = "ACGTTAGCCA" * 20
+    rc = _reverse_complement(seq)
+    v_fwd = kmer_vector(seq, k=4)
+    v_rc = kmer_vector(rc, k=4)
+    np.testing.assert_allclose(
+        v_fwd, v_rc, atol=1e-5, err_msg="RC of sequence should yield identical k-mer vector"
+    )
+
+
+def test_reverse_complement_correctness() -> None:
+    """Spot-check the RC helper."""
+    from plasflow2.classify.features import _reverse_complement
+
+    assert _reverse_complement("ACGT") == "ACGT"  # palindrome
+    assert _reverse_complement("AAAA") == "TTTT"
+    assert _reverse_complement("GCGC") == "GCGC"  # palindrome
+    assert _reverse_complement("ATCG") == "CGAT"

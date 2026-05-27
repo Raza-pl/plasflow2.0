@@ -1,9 +1,11 @@
 """k-mer frequency feature extraction.
 
 Week 2 — Day 9 implementation target.
+Day 3 update: reverse-complement aware counting (strand-invariant features).
 
 Feature vector: k=4 (256 dims) + k=5 (1024 dims) = 1280 dims, L2-normalised.
-(Plan also mentions 5-mer reverse-complement, expanding to 2080 dims — see TODO.)
+Counts from both the forward strand and its reverse complement are merged before
+normalisation, making features strand-invariant (required for double-stranded DNA).
 """
 
 from __future__ import annotations
@@ -20,10 +22,21 @@ logger = logging.getLogger(__name__)
 # k-mer sizes to use
 KMER_SIZES = (4, 5)
 
+# Complement mapping for reverse-complement calculation
+_COMPLEMENT: dict[str, str] = {"A": "T", "T": "A", "C": "G", "G": "C"}
+
 
 def _all_kmers(k: int) -> list[str]:
     """Return sorted list of all k-mers over {A, C, G, T}."""
     return ["".join(p) for p in itertools.product("ACGT", repeat=k)]
+
+
+def _reverse_complement(seq: str) -> str:
+    """Return the reverse complement of a DNA string.
+
+    Non-ACGT characters are dropped (treated as absent).
+    """
+    return "".join(_COMPLEMENT.get(b, "") for b in reversed(seq.upper()))
 
 
 # Pre-build k-mer vocabularies and index maps
@@ -38,21 +51,30 @@ FEATURE_DIM = sum(len(_VOCAB[k]) for k in KMER_SIZES)  # 256 + 1024 = 1280
 def kmer_vector(seq: str, k: int) -> NDArray[np.float32]:
     """Compute normalised k-mer frequency vector for one sequence.
 
+    Counts k-mers from both the forward strand and its reverse complement,
+    then merges them into a single strand-invariant frequency vector before
+    L2-normalisation.
+
     Args:
-        seq: DNA string (uppercase).
-        k: k-mer size.
+        seq: DNA string (any case; non-ACGT characters are skipped).
+        k: k-mer size (must be a key in KMER_SIZES).
 
     Returns:
         Float32 array of shape (4**k,), L2-normalised.
+        Returns a zero vector if the sequence is shorter than k.
     """
     vocab_size = 4**k
     idx_map = _KMER_TO_IDX[k]
     counts = np.zeros(vocab_size, dtype=np.float32)
     seq = seq.upper()
-    for i in range(len(seq) - k + 1):
-        kmer = seq[i : i + k]
-        if kmer in idx_map:
-            counts[idx_map[kmer]] += 1
+    rc_seq = _reverse_complement(seq)
+
+    for strand in (seq, rc_seq):
+        for i in range(len(strand) - k + 1):
+            kmer = strand[i : i + k]
+            if kmer in idx_map:
+                counts[idx_map[kmer]] += 1
+
     norm = np.linalg.norm(counts)
     if norm > 0:
         counts /= norm
@@ -67,11 +89,6 @@ def extract_features(sequences: list[str]) -> NDArray[np.float32]:
 
     Returns:
         Float32 array of shape (N, FEATURE_DIM).
-
-    TODO (Day 9):
-        - Process in batches to avoid RAM overflow on large inputs.
-        - Add reverse-complement k-mers (expands dim to 2080 per plan).
-        - Cache computed vectors to HDF5 for reuse across runs.
     """
     n = len(sequences)
     X = np.zeros((n, FEATURE_DIM), dtype=np.float32)
