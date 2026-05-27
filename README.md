@@ -3,9 +3,9 @@
 [![CI](https://github.com/Raza-pl/plasflow2.0/actions/workflows/ci.yml/badge.svg)](https://github.com/Raza-pl/plasflow2.0/actions)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Tests](https://img.shields.io/badge/tests-139%20passing-brightgreen.svg)](#development)
+[![Tests](https://img.shields.io/badge/tests-175%20passing-brightgreen.svg)](#development)
 
-**PlasFlow v2** classifies metagenomic contigs as plasmid, chromosome, phage, or archaea, annotates antibiotic resistance genes (ARGs) via CARD, determines mobility class with MOB-suite, scores AMR risk (0–10), and produces an interactive HTML report — all in one command.
+**PlasFlow v2** classifies metagenomic contigs as plasmid, chromosome, phage, or archaea, annotates antibiotic resistance genes (ARGs) via CARD, determines mobility class with MOB-suite, assigns taxonomy via DIAMOND + GTDB LCA, scores AMR risk (0–10), and produces an interactive HTML report — all in one command.
 
 This is a full rewrite of [PlasFlow v1](https://github.com/smaegol/PlasFlow) (Krawczyk et al., *Nucleic Acids Research* 2018) on a modern stack, tested on real wastewater metagenomes with 170,000+ contigs.
 
@@ -20,11 +20,12 @@ This is a full rewrite of [PlasFlow v1](https://github.com/smaegol/PlasFlow) (Kr
 | Architecture | TF neural net | **4-class MLP (97.4% accuracy)** + Random Forest |
 | ARG annotation | ✗ | DIAMOND + CARD |
 | Mobility typing | ✗ | MOB-suite (conjugative / mobilizable / non-mobilizable) |
+| Taxonomy | ✗ | **DIAMOND + GTDB LCA (Kaiju-style)** per contig |
 | AMR risk score | ✗ | 0–10 score with evidence breakdown |
 | Output | TSV only | TSV + FASTA bins + **interactive HTML report** |
-| Install | conda-only | pip / Poetry |
+| Install | conda-only | pip / Poetry + `plasflow2 setup` guide |
 | Apple Silicon | ✗ | MPS (M1/M2/M3) accelerated |
-| Test suite | ✗ | **139 tests** (unit + integration) |
+| Test suite | ✗ | **175 tests** (unit + integration) |
 
 ---
 
@@ -111,13 +112,22 @@ python scripts/train_model.py \
 
 ```bash
 plasflow2 run \
-  --input   assembly.fasta \
-  --output  ./results/ \
-  --model   data/models/mlp_v2.pt \
-  --card-db data/databases/card/card.dmnd \
-  --aro-index data/databases/card/aro_index.tsv \
-  --context clinical \
-  --threads 8
+  --input        assembly.fasta \
+  --output       ./results/ \
+  --model        data/models/mlp_v2.pt \
+  --card-db      data/databases/card/card.dmnd \
+  --aro-index    data/databases/card/aro_index.tsv \
+  --taxonomy-db  data/databases/gtdb/gtdb_r220.dmnd \
+  --taxon-map    data/databases/gtdb/taxon_map.tsv \
+  --context      wastewater \
+  --threads      8
+```
+
+Skip optional modules when databases are unavailable:
+
+```bash
+plasflow2 run --input assembly.fasta --output ./results/ \
+  --skip-mobility --skip-taxonomy
 ```
 
 **Outputs in `./results/`:**
@@ -130,7 +140,7 @@ plasflow2 run \
 | `phage.fasta` | Classified phage sequences |
 | `archaea.fasta` | Classified archaeal sequences |
 | `unclassified.fasta` | Low-confidence sequences (below threshold) |
-| `annotations.json` | ARG hits, mobility type, replicon, risk score per plasmid contig |
+| `annotations.json` | ARG hits, mobility type, taxonomy, risk score per plasmid contig |
 | `report.html` | Self-contained interactive HTML report (Plotly + DataTables) |
 
 ### Classify only (no DIAMOND or MOB-suite required)
@@ -171,10 +181,11 @@ plasflow2 report \
 plasflow2 [--verbose] COMMAND [OPTIONS]
 
 Commands:
-  run        Full pipeline: classify → annotate → risk score → report
+  run        Full pipeline: classify → annotate → taxonomy → risk → report
   classify   Classify sequences only; write predictions.tsv
   annotate   Annotate plasmid sequences with ARGs and mobility
   report     Build HTML report from existing annotations + predictions
+  setup      Print installation guide for all external dependencies
 
 Options for plasflow2 run:
   --input / -i        Input assembly FASTA (required)
@@ -182,13 +193,32 @@ Options for plasflow2 run:
   --model             Path to .pt model weights
   --card-db           CARD DIAMOND database (.dmnd)
   --aro-index         CARD ARO index (aro_index.tsv)
+  --taxonomy-db       DIAMOND database built from GTDB-r220 / RefSeq proteins
+  --taxon-map         2-column accession→lineage TSV (improves LCA accuracy)
   --threshold         Confidence threshold, default 0.7
   --context           clinical | wastewater | environmental | unspecified
   --threads           CPU threads for DIAMOND/MOB-suite, default 8
   --min-length        Minimum contig length in bp, default 1000
   --skip-mobility     Skip MOB-suite (use when mob_typer is unavailable)
+  --skip-taxonomy     Skip taxonomy annotation (use when no GTDB DB available)
   --verbose / -v      Enable debug logging
 ```
+
+Run `plasflow2 setup` for step-by-step instructions on downloading and indexing all databases.
+
+---
+
+## Taxonomy annotation
+
+Each contig is annotated with its lowest common ancestor (LCA) taxon using DIAMOND blastx against the GTDB-r220 representative protein database. The algorithm is Kaiju-style: it collects the top-10 hits per contig, walks from domain → species, and accepts the deepest rank where a strict majority (>50%) of hits agree. Ties at a rank are resolved upward to the parent — so a 50/50 Escherichia/Klebsiella split correctly lands at family (Enterobacteriaceae) rather than arbitrarily picking one genus.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--taxonomy-db` | — | DIAMOND .dmnd built from GTDB-r220 proteins |
+| `--taxon-map` | — | 2-column accession→lineage TSV (output of `build_gtdb_taxon_map`) |
+| `--skip-taxonomy` | False | Skip the step entirely |
+
+Taxonomy is stored per-contig in `annotations.json` (`lineage`, `rank`, `taxon`, `agreement`) and shown as the "Taxonomy (LCA)" column in the HTML report.
 
 ---
 
@@ -217,11 +247,14 @@ Risk ≥ 7 = high (red in report), 4–6 = medium (orange), 0–3 = low (green).
 
 The HTML report (`report.html`) is fully self-contained — no server needed, open it in any browser. It includes:
 
-- Summary stats panel (total sequences, plasmids, ARGs)
+- Summary stats panel (total sequences, plasmids, ARGs, taxonomy-classified contigs)
 - Classification pie chart (Plotly)
 - ARG counts by drug class (horizontal bar chart)
 - Risk score distribution histogram (colour-coded by tier)
-- Per-plasmid detail table (sortable, searchable via DataTables.js)
+- **Contig length vs risk score scatter plot** (coloured by mobility class)
+- **Top-15 taxonomy bar chart** for plasmid contigs (GTDB LCA assignments)
+- **Risk-tier filter buttons** — show All / High (≥7) / Medium (4–6) / Low (0–3) contigs instantly
+- Per-plasmid detail table with contig length, taxonomy (LCA), and full risk evidence (sortable + searchable via DataTables.js)
 
 ---
 
@@ -232,7 +265,7 @@ The HTML report (`report.html`) is fully self-contained — no server needed, op
 poetry install --with dev
 pre-commit install
 
-# Run all tests (139 tests — unit + integration)
+# Run all tests (175 tests — unit + integration)
 pytest tests/ -v
 
 # Lint + type-check
@@ -257,7 +290,7 @@ python scripts/download_metagenome.py \
 
 ```
 tests/
-  unit/            117 tests — each module tested in isolation with synthetic data
+  unit/            153 tests — each module tested in isolation with synthetic data
     test_features.py       k-mer feature extraction (RC-aware)
     test_train.py          MLP + RF training pipeline
     test_build_dataset.py  dataset builder helpers
@@ -265,19 +298,22 @@ tests/
     test_args.py           ARG annotation (DIAMOND/CARD)
     test_mobility.py       MOB-suite integration
     test_risk_scorer.py    AMR risk scoring formula
+    test_taxonomy.py       DIAMOND+LCA taxonomy (parse_lineage, lca_for_contig, assign_taxonomy)
     test_pipeline.py       end-to-end pipeline orchestration
     test_report.py         HTML report generator
     test_cli.py            CLI subcommands (CliRunner)
   integration/      22 tests — real data flow with mocked external binaries
-    test_pipeline.py       classify→annotate→risk→report chain, all CLI subcommands
+    test_pipeline.py       classify→annotate→taxonomy→risk→report chain, all CLI subcommands
 ```
 
 ---
 
 ## Roadmap
 
-- [ ] Taxonomy annotation per contig (DIAMOND + GTDB LCA, Kaiju-style)
+- [x] Taxonomy annotation per contig (DIAMOND + GTDB LCA, Kaiju-style)
 - [ ] Expanded chromosomal training data (100+ species across major phyla)
+- [ ] Drug-class co-occurrence heatmap across plasmid contigs (in report)
+- [ ] Docker image for zero-setup deployment
 - [ ] Snakemake / Nextflow workflow wrapper for batch processing
 - [ ] PyPI release
 
