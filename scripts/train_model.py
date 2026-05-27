@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import pickle
 from pathlib import Path
 
 import numpy as np
@@ -94,18 +93,60 @@ def main() -> None:
     logger.info("Loaded X=%s  y=%s", X.shape, y.shape)
 
     if args.rf:
-        logger.info("Training Random Forest …")
-        rf = train_rf(X, y)
-        rf_path = out_dir / "rf_v2.pkl"
-        with open(rf_path, "wb") as f:
-            pickle.dump(rf, f)
-        logger.info("Saved RF to %s", rf_path)
+        import time
+
+        from plasflow2.classify.train import evaluate, save_rf, split_data
+        from plasflow2.classify.train import train_rf as _train_rf  # use library version
+        from plasflow2.utils.device import IDX_TO_CLASS
+
+        logger.info("Splitting data …")
+        X_tr, X_va, X_te, y_tr, y_va, y_te = split_data(X, y, val_size=0.1, test_size=0.1)
+        logger.info("Train=%d  Val=%d  Test=%d", len(X_tr), len(X_va), len(X_te))
+
+        logger.info("Training Random Forest (500 trees, n_jobs=-1) …")
+        t0 = time.time()
+        rf = _train_rf(X_tr, y_tr, cv_folds=0)
+        logger.info("RF trained in %.1f s", time.time() - t0)
+
+        class_names = [IDX_TO_CLASS[i] for i in sorted(IDX_TO_CLASS)]
+        result = evaluate(y_te, rf.predict(X_te), class_names=class_names)
+        logger.info("Test accuracy: %.4f", result["accuracy"])
+        logger.info("\n%s", result["report"])
+
+        save_rf(rf, out_dir / "rf_v2.pkl")
 
     if args.mlp:
-        logger.info("Training MLP …")
-        from plasflow2.classify.model import save_model
+        import time
 
-        model = train_mlp(X, y, epochs=args.epochs)
+        from plasflow2.classify.model import save_model
+        from plasflow2.classify.train import evaluate, split_data
+        from plasflow2.classify.train import train_mlp as _train_mlp
+        from plasflow2.utils.device import IDX_TO_CLASS
+
+        logger.info("Splitting data …")
+        X_tr, X_va, X_te, y_tr, y_va, y_te = split_data(X, y, val_size=0.1, test_size=0.1)
+        logger.info("Train=%d  Val=%d  Test=%d", len(X_tr), len(X_va), len(X_te))
+
+        logger.info("Training MLP (AdamW + cosine LR + early stopping) …")
+        t0 = time.time()
+        model = _train_mlp(
+            X_tr, y_tr, X_va, y_va,
+            epochs=args.epochs,
+            batch_size=512,
+            lr=1e-3,
+            patience=10,
+        )
+        logger.info("MLP trained in %.1f s", time.time() - t0)
+
+        import torch
+
+        class_names = [IDX_TO_CLASS[i] for i in sorted(IDX_TO_CLASS)]
+        with torch.no_grad():
+            y_pred_mlp = model(torch.tensor(X_te).float()).argmax(dim=-1).numpy()
+        result = evaluate(y_te, y_pred_mlp, class_names=class_names)
+        logger.info("Test accuracy: %.4f", result["accuracy"])
+        logger.info("\n%s", result["report"])
+
         save_model(model, out_dir / "mlp_v2.pt")
 
 

@@ -281,13 +281,30 @@ def evaluate(
     Args:
         y_true: Ground-truth integer labels.
         y_pred: Predicted integer labels.
-        class_names: Human-readable class names for the report.
+        class_names: Human-readable class names indexed by label value.
+                     Only names for labels actually present in y_true are used,
+                     so passing the full 4-class list is safe even when some
+                     classes (e.g. archaea) are absent from the current dataset.
 
     Returns:
         Dict with keys: accuracy, report (str), confusion_matrix (ndarray).
     """
     acc = accuracy_score(y_true, y_pred)
-    report = classification_report(y_true, y_pred, target_names=class_names, zero_division=0)
-    cm = confusion_matrix(y_true, y_pred)
+
+    # Restrict target_names to labels that actually appear in the data
+    present_labels = sorted(set(y_true.tolist()) | set(y_pred.tolist()))
+    if class_names is not None:
+        present_names = [class_names[i] for i in present_labels if i < len(class_names)]
+    else:
+        present_names = None
+
+    report = classification_report(
+        y_true,
+        y_pred,
+        labels=present_labels,
+        target_names=present_names,
+        zero_division=0,
+    )
+    cm = confusion_matrix(y_true, y_pred, labels=present_labels)
     logger.info("Accuracy: %.4f\n%s", acc, report)
     return {"accuracy": acc, "report": report, "confusion_matrix": cm}
