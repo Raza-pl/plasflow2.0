@@ -306,5 +306,6 @@ def evaluate(
         zero_division=0,
     )
     cm = confusion_matrix(y_true, y_pred, labels=present_labels)
-    logger.info("Accuracy: %.4f\n%s", acc, report)
+    # Use DEBUG so callers control whether the full report is printed
+    logger.debug("Accuracy: %.4f\n%s", acc, report)
     return {"accuracy": acc, "report": report, "confusion_matrix": cm}

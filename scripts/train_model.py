@@ -141,8 +141,13 @@ def main() -> None:
         import torch
 
         class_names = [IDX_TO_CLASS[i] for i in sorted(IDX_TO_CLASS)]
+        from plasflow2.utils.device import get_device
+
+        device = get_device()
         with torch.no_grad():
-            y_pred_mlp = model(torch.tensor(X_te).float()).argmax(dim=-1).numpy()
+            y_pred_mlp = (
+                model(torch.tensor(X_te).float().to(device)).argmax(dim=-1).cpu().numpy()
+            )
         result = evaluate(y_te, y_pred_mlp, class_names=class_names)
         logger.info("Test accuracy: %.4f", result["accuracy"])
         logger.info("\n%s", result["report"])
