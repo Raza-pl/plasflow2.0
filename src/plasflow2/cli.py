@@ -5,12 +5,20 @@ Usage:
     plasflow2 run --input assembly.fasta --output ./results/ \\
                   --threshold 0.7 --context clinical --threads 8
 
+    # With taxonomy annotation
+    plasflow2 run --input assembly.fasta --output ./results/ \\
+                  --taxonomy-db data/databases/gtdb/gtdb_r220.dmnd \\
+                  --taxon-map   data/databases/gtdb/taxon_map.tsv
+
     # Individual steps
     plasflow2 classify  --input assembly.fasta --output results/predictions.tsv
     plasflow2 annotate  --input plasmids.fasta  --output results/annotations/
     plasflow2 report    --input results/        --output results/report.html
 
-Week 4 — Days 21-22 implementation.
+    # Print setup / install instructions
+    plasflow2 setup
+
+Week 4 — Days 21-22 + 26 implementation.
 """
 
 from __future__ import annotations
@@ -101,11 +109,12 @@ def _write_predictions_tsv(predictions: list, output_path: Path) -> None:
 
 
 def _write_annotations_json(plasmid_results: list, output_path: Path) -> None:
-    """Serialise ARG + mobility + risk annotations to JSON."""
+    """Serialise ARG + mobility + risk + taxonomy annotations to JSON."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     records = []
     for cr in plasmid_results:
         mob = cr.mobility
+        tax = getattr(cr, "taxonomy", None)
         records.append(
             {
                 "contig_id": cr.record.id,
@@ -114,6 +123,17 @@ def _write_annotations_json(plasmid_results: list, output_path: Path) -> None:
                     "label": cr.prediction.label,
                     "confidence": cr.prediction.confidence,
                 },
+                "taxonomy": (
+                    {
+                        "lineage": tax.lineage,
+                        "rank": tax.rank,
+                        "taxon": tax.taxon,
+                        "num_hits": tax.num_hits,
+                        "agreement": tax.agreement,
+                    }
+                    if tax
+                    else None
+                ),
                 "mobility": (
                     {
                         "mobility_class": mob.mobility_class if mob else "unknown",
@@ -231,6 +251,26 @@ def main(ctx: click.Context, verbose: bool) -> None:
     default=False,
     help="Skip MOB-suite mobility typing (use when mob_typer is unavailable).",
 )
+@click.option(
+    "--taxonomy-db",
+    "taxonomy_db",
+    default=None,
+    type=click.Path(),
+    help="DIAMOND database (.dmnd) built from GTDB-r220 / RefSeq proteins for taxonomy.",
+)
+@click.option(
+    "--taxon-map",
+    "taxon_map",
+    default=None,
+    type=click.Path(),
+    help="2-column TSV mapping accession → GTDB lineage (optional, improves LCA accuracy).",
+)
+@click.option(
+    "--skip-taxonomy",
+    is_flag=True,
+    default=False,
+    help="Skip taxonomy annotation (use when no taxonomy DB is available).",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -244,6 +284,9 @@ def run(
     threads: int,
     min_length: int,
     skip_mobility: bool,
+    taxonomy_db: str | None,
+    taxon_map: str | None,
+    skip_taxonomy: bool,
 ) -> None:
     """Run the full PlasFlow v2 pipeline: classify → annotate → risk → report.
 
@@ -279,6 +322,9 @@ def run(
         min_contig_length=min_length,
         threads=threads,
         skip_mobility=skip_mobility,
+        taxonomy_db=taxonomy_db,
+        taxon_map_path=taxon_map,
+        skip_taxonomy=skip_taxonomy,
     )
 
     # --- Write predictions TSV (all contigs) ---
@@ -597,15 +643,24 @@ def report_cmd(
                 if dc.strip() and dc.strip() != "unknown"
             }
         )
+
+        # Taxonomy from annotations.json (added in Day 26)
+        tax_data = rec.get("taxonomy")
+        tax_display = "—"
+        if tax_data and tax_data.get("rank") and tax_data["rank"] != "unclassified":
+            tax_display = f"{tax_data['rank']}: {tax_data['taxon']}"
+
         plasmid_rows.append(
             PlasmidRow(
                 contig_id=cid,
-                confidence=0.0,  # not in annotations.json
+                contig_length=rec.get("length", 0),
+                confidence=rec.get("classification", {}).get("confidence", 0.0),
                 num_args=len(hits),
                 drug_classes="; ".join(unique_classes) if unique_classes else "—",
                 mobility_class=mob.mobility_class if mob else "unknown",
                 replicon_type=mob.replicon_type if mob else "unknown",
                 risk_score=risk.score,
+                taxonomy=tax_display,
                 risk_evidence="; ".join(risk.evidence) if risk.evidence else "—",
             )
         )
@@ -624,6 +679,128 @@ def report_cmd(
 
     out_path = generate_report(report_data, output_html)
     click.echo(f"Report → {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# plasflow2 setup
+# ---------------------------------------------------------------------------
+
+_SETUP_TEXT = """
+PlasFlow v2 — External Dependency Setup
+========================================
+
+PlasFlow v2 requires the following external tools and databases.
+Run the commands below once to get everything ready.
+
+─────────────────────────────────────────
+1. PYTHON DEPENDENCIES  (pip / Poetry)
+─────────────────────────────────────────
+    pip install poetry
+    poetry install          # installs plasflow2 + all Python deps
+
+─────────────────────────────────────────
+2. SYSTEM TOOLS  (conda recommended)
+─────────────────────────────────────────
+    # DIAMOND  — ARG annotation + taxonomy search
+    conda install -c bioconda diamond
+
+    # MOB-suite — plasmid mobility typing
+    conda install -c conda-forge -c bioconda mob_suite
+
+    # Prodigal  — ORF prediction (Python wrapper bundled)
+    # Already installed via:  pip install pyrodigal
+
+─────────────────────────────────────────
+3. CARD DATABASE  (ARG annotation)
+─────────────────────────────────────────
+    mkdir -p data/databases/card
+    cd data/databases/card
+
+    # Download the latest CARD data bundle:
+    wget https://card.mcmaster.ca/latest/data -O card.tar.bz2
+
+    # Extract and build DIAMOND database:
+    python -c "
+    from plasflow2.annotate.args import setup_card_db
+    setup_card_db('data/databases/card')
+    "
+
+    # Expected output:
+    #   data/databases/card/card.dmnd
+    #   data/databases/card/aro_index.tsv
+
+─────────────────────────────────────────
+4. GTDB DATABASE  (taxonomy annotation)
+─────────────────────────────────────────
+    mkdir -p data/databases/gtdb
+    cd data/databases/gtdb
+
+    # Download GTDB-r220 representative protein sequences (~2 GB):
+    wget https://data.ace.uq.edu.au/public/gtdb/data/releases/release220/220.0/\\
+         genomic_files_reps/gtdb_proteins_aa_reps_r220.tar.gz
+
+    tar xf gtdb_proteins_aa_reps_r220.tar.gz
+
+    # Build DIAMOND protein database:
+    diamond makedb \\
+        --in gtdb_proteins_aa_reps_r220/gtdb_proteins_aa_reps_r220.faa \\
+        -d data/databases/gtdb/gtdb_r220 \\
+        --threads 8
+
+    # Download GTDB taxonomy file and build accession→lineage map:
+    wget https://data.ace.uq.edu.au/public/gtdb/data/releases/release220/220.0/\\
+         bac120_taxonomy_r220.tsv.gz
+    gunzip bac120_taxonomy_r220.tsv.gz
+
+    python -c "
+    from plasflow2.annotate.taxonomy import build_gtdb_taxon_map
+    build_gtdb_taxon_map(
+        'data/databases/gtdb/bac120_taxonomy_r220.tsv',
+        'data/databases/gtdb/taxon_map.tsv'
+    )
+    "
+
+    # Expected output:
+    #   data/databases/gtdb/gtdb_r220.dmnd
+    #   data/databases/gtdb/taxon_map.tsv
+
+─────────────────────────────────────────
+5. RUN THE FULL PIPELINE
+─────────────────────────────────────────
+    plasflow2 run \\
+      --input      assembly.fasta \\
+      --output     results/ \\
+      --card-db    data/databases/card/card.dmnd \\
+      --aro-index  data/databases/card/aro_index.tsv \\
+      --taxonomy-db data/databases/gtdb/gtdb_r220.dmnd \\
+      --taxon-map  data/databases/gtdb/taxon_map.tsv \\
+      --context    wastewater \\
+      --threads    8
+
+    # Skip optional steps when databases are unavailable:
+    plasflow2 run --input assembly.fasta --output results/ \\
+      --skip-mobility --skip-taxonomy
+
+─────────────────────────────────────────
+6. CLASSIFY ONLY (no external databases needed)
+─────────────────────────────────────────
+    plasflow2 classify \\
+      --input  assembly.fasta \\
+      --output predictions.tsv
+
+─────────────────────────────────────────
+Tip: Run 'plasflow2 --help' for all commands and options.
+"""
+
+
+@main.command("setup")
+def setup_cmd() -> None:
+    """Print installation instructions for all external dependencies.
+
+    Covers: Python deps, DIAMOND, MOB-suite, CARD database, GTDB database,
+    and example commands for the full pipeline.
+    """
+    click.echo(_SETUP_TEXT)
 
 
 if __name__ == "__main__":

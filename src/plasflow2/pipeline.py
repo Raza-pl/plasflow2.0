@@ -35,6 +35,7 @@ from plasflow2.annotate.mobility import (
     parse_mob_results,
     run_mob_typer,
 )
+from plasflow2.annotate.taxonomy import TaxResult, assign_taxonomy
 from plasflow2.classify.predict import Prediction, predict
 from plasflow2.risk.scorer import RiskScore, score_plasmid
 from plasflow2.utils.fasta import load_fasta, write_fasta
@@ -56,6 +57,7 @@ class ContigResult:
     arg_hits: list[ARGHit]
     mobility: MobilityResult | None
     risk: RiskScore
+    taxonomy: TaxResult | None = None  # LCA taxonomy from DIAMOND (optional)
 
 
 @dataclass
@@ -65,6 +67,8 @@ class PipelineResult:
     input_fasta: Path
     all_predictions: list[Prediction]  # every contig, all classes
     plasmid_results: list[ContigResult]  # plasmid contigs only, fully annotated
+    # Taxonomy results for ALL contigs (keyed by contig_id); empty if skipped
+    taxonomy: dict[str, TaxResult] = field(default_factory=dict)
     # Convenience counts
     class_counts: dict[str, int] = field(default_factory=dict)
     total_sequences: int = 0
@@ -99,6 +103,9 @@ def run_pipeline(
     min_contig_length: int = 1000,
     threads: int = 8,
     skip_mobility: bool = False,
+    taxonomy_db: Path | str | None = None,
+    taxon_map_path: Path | str | None = None,
+    skip_taxonomy: bool = False,
 ) -> PipelineResult:
     """Run the full PlasFlow v2 pipeline on a FASTA file.
 
@@ -127,6 +134,14 @@ def run_pipeline(
         threads: CPU threads for DIAMOND and MOB-suite.
         skip_mobility: If True, skip mob_typer and set mobility to None
             for all contigs (use when mob_typer is not installed).
+        taxonomy_db: Path to a DIAMOND database (.dmnd) built from GTDB-r220
+            or RefSeq protein sequences for taxonomy annotation.  If ``None``
+            and *skip_taxonomy* is False, taxonomy is skipped with a warning.
+        taxon_map_path: Optional path to a 2-column accession→lineage TSV
+            (output of ``build_gtdb_taxon_map``).  When None, lineage is
+            extracted from DIAMOND ``stitle`` fields.
+        skip_taxonomy: If True, skip taxonomy annotation entirely (useful when
+            no GTDB/RefSeq database is available).
 
     Returns:
         :class:`PipelineResult` with all predictions and per-plasmid
@@ -142,6 +157,9 @@ def run_pipeline(
     aro_index = Path(aro_index)
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
+
+    taxonomy_db_path = Path(taxonomy_db) if taxonomy_db else None
+    taxon_map = Path(taxon_map_path) if taxon_map_path else None
 
     for p, name in [
         (fasta_path, "fasta_path"),
@@ -232,7 +250,32 @@ def run_pipeline(
         logger.info("Mobility annotation skipped (skip_mobility=True)")
 
     # ------------------------------------------------------------------
-    # 6. Risk scoring + assemble ContigResult list
+    # 6. Taxonomy annotation (all contigs, via DIAMOND blastx against GTDB)
+    # ------------------------------------------------------------------
+    taxonomy_by_contig: dict[str, TaxResult] = {}
+    if not skip_taxonomy:
+        if taxonomy_db_path and taxonomy_db_path.exists():
+            logger.info("Running taxonomy annotation on all %d contigs …", len(records))
+            try:
+                taxonomy_by_contig = assign_taxonomy(
+                    fasta_path=fasta_path,
+                    taxonomy_db=taxonomy_db_path,
+                    work_dir=work_dir / "taxonomy",
+                    taxon_map_path=taxon_map,
+                    threads=threads,
+                )
+            except Exception as exc:
+                logger.warning("Taxonomy annotation failed: %s — skipping.", exc)
+        else:
+            logger.info(
+                "Taxonomy database not provided (--taxonomy-db). "
+                "Use --skip-taxonomy to suppress this message."
+            )
+    else:
+        logger.info("Taxonomy annotation skipped (skip_taxonomy=True)")
+
+    # ------------------------------------------------------------------
+    # 7. Risk scoring + assemble ContigResult list
     # ------------------------------------------------------------------
     plasmid_results: list[ContigResult] = []
     for record in plasmid_records:
@@ -247,6 +290,7 @@ def run_pipeline(
                 arg_hits=hits,
                 mobility=mobility,
                 risk=risk,
+                taxonomy=taxonomy_by_contig.get(cid),
             )
         )
 
@@ -254,12 +298,17 @@ def run_pipeline(
         input_fasta=fasta_path,
         all_predictions=predictions,
         plasmid_results=plasmid_results,
+        taxonomy=taxonomy_by_contig,
     )
+    tax_classified = sum(1 for r in taxonomy_by_contig.values() if r.rank != "unclassified")
     logger.info(
-        "Pipeline complete — %d total | %d plasmid | %d ARGs | risk scores %s",
+        "Pipeline complete — %d total | %d plasmid | %d ARGs | "
+        "%d/%d taxonomy-classified | risk scores %s",
         result.total_sequences,
         result.total_plasmids,
         result.total_args,
+        tax_classified,
+        len(taxonomy_by_contig),
         sorted({cr.risk.score for cr in plasmid_results}),
     )
     return result

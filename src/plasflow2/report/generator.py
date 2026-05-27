@@ -1,13 +1,16 @@
 """HTML report generator.
 
-Week 4 — Day 20 implementation.
+Week 4 — Days 20 + 26 implementation.
 
 Produces a single self-contained HTML file with:
   - Summary stats panel
   - Classification pie chart (Plotly)
   - ARG bar chart per drug class (Plotly)
   - AMR risk score histogram (Plotly)
+  - Contig length vs risk score scatter plot (Plotly)
   - Per-plasmid detail table with sortable columns (DataTables.js via CDN)
+  - Risk-tier filter buttons (high / medium / low / all)
+  - Taxonomy column (LCA result from DIAMOND + GTDB)
 
 Usage:
     from plasflow2.report.generator import build_report_data, generate_report
@@ -40,27 +43,47 @@ _TEMPLATE = """<!DOCTYPE html>
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
   <script src="https://cdn.datatables.net/1.13.7/js/jquery.dataTables.min.js"></script>
   <style>
-    body { font-family: -apple-system, Arial, sans-serif; margin: 24px; color: #333; }
-    h1 { color: #2c6fad; }
-    h2 { color: #444; margin-top: 32px; }
-    .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin: 24px 0; }
-    .stat-card { background: #f5f8ff; border-left: 4px solid #2c6fad; padding: 16px; border-radius: 4px; }
-    .stat-card h3 { margin: 0 0 8px; font-size: 0.85rem; text-transform: uppercase; color: #666; }
-    .stat-card p  { margin: 0; font-size: 1.8rem; font-weight: 700; color: #2c6fad; }
-    .charts-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin: 24px 0; }
-    .chart-box { min-height: 320px; }
+    body { font-family: -apple-system, Arial, sans-serif; margin: 24px; color: #333; background: #fafafa; }
+    h1 { color: #2c6fad; margin-bottom: 4px; }
+    h2 { color: #444; margin-top: 36px; border-bottom: 2px solid #e0e8f5; padding-bottom: 6px; }
+    .meta { color: #666; font-size: 0.92rem; margin-bottom: 20px; }
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; margin: 20px 0; }
+    .stat-card { background: #fff; border-left: 4px solid #2c6fad; padding: 14px 16px; border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+    .stat-card h3 { margin: 0 0 6px; font-size: 0.78rem; text-transform: uppercase; color: #777; letter-spacing: .5px; }
+    .stat-card p  { margin: 0; font-size: 1.7rem; font-weight: 700; color: #2c6fad; }
+    .charts-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 24px 0; }
+    .charts-row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin: 24px 0; }
+    .chart-box { background: #fff; border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,.08); padding: 4px; min-height: 320px; }
     table.dataTable { width: 100% !important; }
+    table.dataTable tbody tr:hover { background-color: #f0f6ff; }
     .risk-high   { color: #c0392b; font-weight: bold; }
     .risk-medium { color: #e67e22; font-weight: bold; }
     .risk-low    { color: #27ae60; font-weight: bold; }
+    .filter-bar  { margin: 12px 0 8px; display: flex; gap: 8px; align-items: center; }
+    .filter-btn  { padding: 6px 16px; border: none; border-radius: 20px; cursor: pointer;
+                   font-size: 0.85rem; font-weight: 600; transition: opacity .15s; }
+    .filter-btn:hover { opacity: 0.85; }
+    .filter-btn.active { outline: 3px solid #333; }
+    .btn-all    { background: #e0e0e0; color: #333; }
+    .btn-high   { background: #c0392b; color: #fff; }
+    .btn-medium { background: #e67e22; color: #fff; }
+    .btn-low    { background: #27ae60; color: #fff; }
+    .tax-label  { font-size: 0.82rem; color: #555; max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .no-data-note { color: #888; font-style: italic; font-size: 0.9rem; margin: 8px 0; }
+    footer { margin-top: 40px; color: #aaa; font-size: 0.8rem; border-top: 1px solid #e5e5e5; padding-top: 12px; }
   </style>
 </head>
 <body>
   <h1>PlasFlow v2 — Analysis Report</h1>
-  <p>Input: <code>{{ input_file }}</code> &nbsp;|&nbsp;
-     Sequences: <strong>{{ total }}</strong> &nbsp;|&nbsp;
-     Plasmids: <strong>{{ num_plasmids }}</strong> &nbsp;|&nbsp;
-     ARGs: <strong>{{ total_args }}</strong></p>
+  <p class="meta">
+    Input: <code>{{ input_file }}</code> &nbsp;|&nbsp;
+    Sequences: <strong>{{ total }}</strong> &nbsp;|&nbsp;
+    Plasmids: <strong>{{ num_plasmids }}</strong> &nbsp;|&nbsp;
+    ARGs: <strong>{{ total_args }}</strong>
+    {% if tax_classified is defined and tax_classified > 0 %}
+    &nbsp;|&nbsp; Taxonomy-classified: <strong>{{ tax_classified }}</strong>
+    {% endif %}
+  </p>
 
   <div class="stats-grid">
     {% for label, count in class_counts.items() %}
@@ -68,30 +91,50 @@ _TEMPLATE = """<!DOCTYPE html>
     {% endfor %}
   </div>
 
-  <div class="charts-row">
-    <div id="pie-chart"  class="chart-box"></div>
-    <div id="arg-chart"  class="chart-box"></div>
-    <div id="risk-chart" class="chart-box"></div>
+  <h2>Classification & ARG Overview</h2>
+  <div class="charts-row-3">
+    <div id="pie-chart"    class="chart-box"></div>
+    <div id="arg-chart"    class="chart-box"></div>
+    <div id="risk-chart"   class="chart-box"></div>
   </div>
 
+  {% if has_scatter %}
+  <h2>Contig Length vs Risk Score</h2>
+  <div class="charts-row">
+    <div id="scatter-chart" class="chart-box" style="min-height:350px;"></div>
+    <div id="tax-chart"     class="chart-box" style="min-height:350px;"></div>
+  </div>
+  {% endif %}
+
   <h2>Plasmid Detail</h2>
+  <div class="filter-bar">
+    <span style="font-size:.85rem;color:#555;">Filter by risk tier:</span>
+    <button class="filter-btn btn-all active"    id="btn-all"    onclick="filterRisk('all')">All</button>
+    <button class="filter-btn btn-high"   id="btn-high"   onclick="filterRisk('high')">High (&ge;7)</button>
+    <button class="filter-btn btn-medium" id="btn-medium" onclick="filterRisk('medium')">Medium (4–6)</button>
+    <button class="filter-btn btn-low"    id="btn-low"    onclick="filterRisk('low')">Low (0–3)</button>
+  </div>
+  {% if plasmid_rows %}
   <table id="plasmid-table" class="display">
     <thead>
       <tr>
         <th>Contig</th>
+        <th>Length (bp)</th>
         <th>Confidence</th>
         <th>ARGs</th>
         <th>Drug Classes</th>
         <th>Mobility</th>
         <th>Replicon</th>
         <th>Risk Score</th>
+        <th>Taxonomy (LCA)</th>
         <th>Risk Evidence</th>
       </tr>
     </thead>
     <tbody>
       {% for row in plasmid_rows %}
-      <tr>
+      <tr data-risk-tier="{% if row.risk_score >= 7 %}high{% elif row.risk_score >= 4 %}medium{% else %}low{% endif %}">
         <td>{{ row.contig_id }}</td>
+        <td>{{ row.contig_length }}</td>
         <td>{{ "%.3f" | format(row.confidence) }}</td>
         <td>{{ row.num_args }}</td>
         <td>{{ row.drug_classes }}</td>
@@ -100,13 +143,20 @@ _TEMPLATE = """<!DOCTYPE html>
         <td class="{% if row.risk_score >= 7 %}risk-high{% elif row.risk_score >= 4 %}risk-medium{% else %}risk-low{% endif %}">
           {{ row.risk_score }}
         </td>
+        <td class="tax-label" title="{{ row.taxonomy }}">{{ row.taxonomy }}</td>
         <td>{{ row.risk_evidence }}</td>
       </tr>
       {% endfor %}
     </tbody>
   </table>
+  {% else %}
+  <p class="no-data-note">No plasmid contigs detected in this run.</p>
+  {% endif %}
+
+  <footer>Generated by PlasFlow v2 &mdash; open in any modern browser, no server required.</footer>
 
   <script>
+    // ---- Plotly charts ----
     var pieData = {{ pie_data | tojson }};
     Plotly.newPlot('pie-chart', pieData.data, pieData.layout, {responsive: true});
 
@@ -116,9 +166,41 @@ _TEMPLATE = """<!DOCTYPE html>
     var riskData = {{ risk_data | tojson }};
     Plotly.newPlot('risk-chart', riskData.data, riskData.layout, {responsive: true});
 
+    {% if has_scatter %}
+    var scatterData = {{ scatter_data | tojson }};
+    Plotly.newPlot('scatter-chart', scatterData.data, scatterData.layout, {responsive: true});
+
+    var taxData = {{ tax_bar_data | tojson }};
+    Plotly.newPlot('tax-chart', taxData.data, taxData.layout, {responsive: true});
+    {% endif %}
+
+    // ---- DataTable ----
+    var table = null;
     $(document).ready(function() {
-      $('#plasmid-table').DataTable({order: [[6, 'desc']]});
+      table = $('#plasmid-table').DataTable({order: [[7, 'desc']], pageLength: 25});
     });
+
+    // ---- Risk tier filter ----
+    function filterRisk(tier) {
+      // Update button styles
+      ['all','high','medium','low'].forEach(function(t) {
+        document.getElementById('btn-' + t).classList.toggle('active', t === tier);
+      });
+      if (!table) return;
+      // Use DataTables search with a custom filter plugin
+      $.fn.dataTable.ext.search = $.fn.dataTable.ext.search.filter(function(f) {
+        return f.__riskFilter !== true;
+      });
+      if (tier !== 'all') {
+        var fn = function(settings, data, dataIndex) {
+          var row = table.row(dataIndex).node();
+          return $(row).data('risk-tier') === tier;
+        };
+        fn.__riskFilter = true;
+        $.fn.dataTable.ext.search.push(fn);
+      }
+      table.draw();
+    }
   </script>
 </body>
 </html>
@@ -135,12 +217,14 @@ class PlasmidRow:
     """One row in the per-plasmid detail table."""
 
     contig_id: str
+    contig_length: int
     confidence: float
     num_args: int
     drug_classes: str  # semicolon-separated unique drug classes
     mobility_class: str
     replicon_type: str
     risk_score: int
+    taxonomy: str  # LCA display string, e.g. "genus: g__Klebsiella"
     risk_evidence: str  # semicolon-separated evidence strings
 
 
@@ -175,6 +259,8 @@ def _build_pie_data(class_counts: dict[str, int]) -> dict:
             "title": {"text": "Sequence Classification", "font": {"size": 14}},
             "margin": {"t": 50, "b": 20, "l": 20, "r": 20},
             "showlegend": False,
+            "paper_bgcolor": "rgba(0,0,0,0)",
+            "plot_bgcolor": "rgba(0,0,0,0)",
         },
     }
 
@@ -183,19 +269,19 @@ def _build_arg_chart(arg_hits: list) -> dict:
     """Plotly horizontal bar chart: ARG count per drug class."""
     drug_class_counts: Counter[str] = Counter()
     for hit in arg_hits:
-        # drug_class may be semicolon-separated
         for dc in hit.drug_class.split(";"):
             dc = dc.strip()
             if dc and dc != "unknown":
                 drug_class_counts[dc] += 1
 
     if not drug_class_counts:
-        # Empty placeholder
         return {
             "data": [{"type": "bar", "x": [], "y": [], "orientation": "h"}],
             "layout": {
                 "title": {"text": "ARG Drug Classes (none detected)", "font": {"size": 14}},
                 "margin": {"t": 50, "b": 40, "l": 180, "r": 20},
+                "paper_bgcolor": "rgba(0,0,0,0)",
+                "plot_bgcolor": "rgba(0,0,0,0)",
             },
         }
 
@@ -217,16 +303,17 @@ def _build_arg_chart(arg_hits: list) -> dict:
             "title": {"text": "ARGs by Drug Class", "font": {"size": 14}},
             "xaxis": {"title": "Gene count"},
             "margin": {"t": 50, "b": 40, "l": 180, "r": 20},
+            "paper_bgcolor": "rgba(0,0,0,0)",
+            "plot_bgcolor": "rgba(0,0,0,0)",
         },
     }
 
 
 def _build_risk_histogram(risk_scores: list[int]) -> dict:
-    """Plotly histogram of risk scores (0–10)."""
-    # Colour each bar: >=7 red, 4-6 orange, 0-3 green
+    """Plotly histogram of risk scores (0–10), colour-coded by tier."""
     bar_colors = []
     counts_by_score = Counter(risk_scores)
-    score_range = list(range(11))  # 0..10
+    score_range = list(range(11))
     y_vals = [counts_by_score.get(s, 0) for s in score_range]
     for s in score_range:
         if s >= 7:
@@ -250,6 +337,95 @@ def _build_risk_histogram(risk_scores: list[int]) -> dict:
             "xaxis": {"title": "Risk Score (0–10)", "dtick": 1},
             "yaxis": {"title": "Plasmid count"},
             "margin": {"t": 50, "b": 50, "l": 50, "r": 20},
+            "paper_bgcolor": "rgba(0,0,0,0)",
+            "plot_bgcolor": "rgba(0,0,0,0)",
+        },
+    }
+
+
+def _build_scatter_data(plasmid_rows: list[PlasmidRow]) -> dict:
+    """Plotly scatter: contig length vs risk score, coloured by mobility class."""
+    mobility_classes = sorted({r.mobility_class for r in plasmid_rows})
+    palette = ["#2c6fad", "#c0392b", "#27ae60", "#e67e22", "#8e44ad", "#16a085", "#d35400"]
+    color_map = {m: palette[i % len(palette)] for i, m in enumerate(mobility_classes)}
+
+    traces = []
+    for mob in mobility_classes:
+        rows = [r for r in plasmid_rows if r.mobility_class == mob]
+        if not rows:
+            continue
+        traces.append(
+            {
+                "type": "scatter",
+                "mode": "markers",
+                "name": mob,
+                "x": [r.contig_length for r in rows],
+                "y": [r.risk_score for r in rows],
+                "text": [
+                    f"{r.contig_id}<br>Risk: {r.risk_score}<br>ARGs: {r.num_args}<br>{r.taxonomy}"
+                    for r in rows
+                ],
+                "hovertemplate": "%{text}<extra></extra>",
+                "marker": {
+                    "color": color_map[mob],
+                    "size": 7,
+                    "opacity": 0.75,
+                    "line": {"width": 0.5, "color": "#fff"},
+                },
+            }
+        )
+
+    return {
+        "data": traces,
+        "layout": {
+            "title": {"text": "Contig Length vs Risk Score", "font": {"size": 14}},
+            "xaxis": {"title": "Contig length (bp)", "type": "log"},
+            "yaxis": {"title": "Risk Score (0–10)", "dtick": 1, "range": [-0.5, 10.5]},
+            "legend": {"title": {"text": "Mobility"}},
+            "margin": {"t": 50, "b": 60, "l": 60, "r": 20},
+            "paper_bgcolor": "rgba(0,0,0,0)",
+            "plot_bgcolor": "rgba(0,0,0,0)",
+        },
+    }
+
+
+def _build_taxonomy_bar(plasmid_rows: list[PlasmidRow]) -> dict:
+    """Plotly bar chart: top-15 taxonomy assignments for plasmid contigs."""
+    tax_counts: Counter[str] = Counter()
+    for r in plasmid_rows:
+        label = r.taxonomy if r.taxonomy and r.taxonomy != "—" else "unclassified"
+        tax_counts[label] += 1
+
+    top15 = tax_counts.most_common(15)
+    if not top15:
+        return {
+            "data": [{"type": "bar", "x": [], "y": []}],
+            "layout": {
+                "title": {"text": "Top Taxonomy (no data)", "font": {"size": 14}},
+                "paper_bgcolor": "rgba(0,0,0,0)",
+                "plot_bgcolor": "rgba(0,0,0,0)",
+            },
+        }
+
+    labels = [item[0] for item in reversed(top15)]
+    counts = [item[1] for item in reversed(top15)]
+
+    return {
+        "data": [
+            {
+                "type": "bar",
+                "x": counts,
+                "y": labels,
+                "orientation": "h",
+                "marker": {"color": "#8e44ad"},
+            }
+        ],
+        "layout": {
+            "title": {"text": "Top Taxonomy (plasmid contigs)", "font": {"size": 14}},
+            "xaxis": {"title": "Contig count"},
+            "margin": {"t": 50, "b": 40, "l": 220, "r": 20},
+            "paper_bgcolor": "rgba(0,0,0,0)",
+            "plot_bgcolor": "rgba(0,0,0,0)",
         },
     }
 
@@ -269,10 +445,11 @@ def build_report_data(pipeline_result, input_file: str = "") -> dict:
     Returns:
         Dict suitable for passing to :func:`generate_report`.
     """
-    # Collect all ARG hits across plasmid contigs
     all_arg_hits = [hit for cr in pipeline_result.plasmid_results for hit in cr.arg_hits]
 
-    # Build per-plasmid table rows
+    # Taxonomy dict (contig_id → TaxResult); may be empty if skipped
+    taxonomy = getattr(pipeline_result, "taxonomy", {}) or {}
+
     plasmid_rows: list[PlasmidRow] = []
     for cr in pipeline_result.plasmid_results:
         unique_classes = sorted(
@@ -284,31 +461,43 @@ def build_report_data(pipeline_result, input_file: str = "") -> dict:
             }
         )
         mob = cr.mobility
+        # Taxonomy: prefer ContigResult.taxonomy if set, else look up in global dict
+        tax = getattr(cr, "taxonomy", None) or taxonomy.get(cr.record.id)
+        tax_display = tax.display if tax else "—"
+
         plasmid_rows.append(
             PlasmidRow(
                 contig_id=cr.record.id,
+                contig_length=len(cr.record.seq),
                 confidence=cr.prediction.confidence,
                 num_args=len(cr.arg_hits),
                 drug_classes="; ".join(unique_classes) if unique_classes else "—",
                 mobility_class=mob.mobility_class if mob else "unknown",
                 replicon_type=mob.replicon_type if mob else "unknown",
                 risk_score=cr.risk.score,
+                taxonomy=tax_display,
                 risk_evidence="; ".join(cr.risk.evidence) if cr.risk.evidence else "—",
             )
         )
 
     risk_scores = [cr.risk.score for cr in pipeline_result.plasmid_results]
+    tax_classified = sum(1 for r in taxonomy.values() if r.rank != "unclassified")
+    has_scatter = len(plasmid_rows) > 0
 
     return {
         "input_file": input_file or str(pipeline_result.input_fasta),
         "total": pipeline_result.total_sequences,
         "num_plasmids": pipeline_result.total_plasmids,
         "total_args": pipeline_result.total_args,
+        "tax_classified": tax_classified,
         "class_counts": pipeline_result.class_counts,
         "pie_data": _build_pie_data(pipeline_result.class_counts),
         "arg_data": _build_arg_chart(all_arg_hits),
         "risk_data": _build_risk_histogram(risk_scores),
+        "scatter_data": _build_scatter_data(plasmid_rows) if has_scatter else {},
+        "tax_bar_data": _build_taxonomy_bar(plasmid_rows) if has_scatter else {},
         "plasmid_rows": plasmid_rows,
+        "has_scatter": has_scatter,
     }
 
 
@@ -339,11 +528,18 @@ def generate_report(
         html = tmpl.render(**report_data)
     except ImportError:
         logger.warning("jinja2 not installed — writing JSON placeholder report")
-        # Produce a minimal but valid HTML fallback that doesn't crash
         safe_data = {
             k: v
             for k, v in report_data.items()
-            if k not in ("pie_data", "arg_data", "risk_data", "plasmid_rows")
+            if k
+            not in (
+                "pie_data",
+                "arg_data",
+                "risk_data",
+                "scatter_data",
+                "tax_bar_data",
+                "plasmid_rows",
+            )
         }
         html = (
             "<html><body><h1>PlasFlow v2 Report</h1>"
