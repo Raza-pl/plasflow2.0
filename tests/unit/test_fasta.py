@@ -3,10 +3,6 @@
 Day 5 target: all tests pass.
 """
 
-from pathlib import Path
-
-import pytest
-
 from plasflow2.utils.fasta import gc_content, split_by_label
 
 
@@ -28,8 +24,8 @@ def test_gc_content_empty() -> None:
 
 
 def test_split_by_label_basic() -> None:
-    from Bio.SeqRecord import SeqRecord
     from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
 
     records = [SeqRecord(Seq("ACGT"), id=f"seq{i}") for i in range(4)]
     labels = ["plasmid", "chromosome", "plasmid", "phage"]

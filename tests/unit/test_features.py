@@ -4,8 +4,6 @@ Day 9 target: all tests pass.
 """
 
 import numpy as np
-import pytest
-
 from plasflow2.classify.features import (
     FEATURE_DIM,
     extract_features,

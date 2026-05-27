@@ -71,7 +71,7 @@ def parse_mob_results(tsv_path: Path) -> list[MobilityResult]:
     with open(tsv_path) as fh:
         header = fh.readline().strip().split("\t")
         for line in fh:
-            parts = dict(zip(header, line.strip().split("\t")))
+            parts = dict(zip(header, line.strip().split("\t"), strict=False))
             results.append(
                 MobilityResult(
                     contig_id=parts.get("sample_id", "unknown"),

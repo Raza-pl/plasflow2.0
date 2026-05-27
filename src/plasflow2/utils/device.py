@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 CLASSES = ["plasmid", "chromosome", "phage", "archaea"]
 NUM_CLASSES = len(CLASSES)
 CLASS_TO_IDX = {c: i for i, c in enumerate(CLASSES)}
-IDX_TO_CLASS = {i: c for i, c in enumerate(CLASSES)}
+IDX_TO_CLASS = dict(enumerate(CLASSES))
 
 
 def get_device() -> torch.device:

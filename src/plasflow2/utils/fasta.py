@@ -6,8 +6,8 @@ Week 1 — Day 5 implementation target.
 from __future__ import annotations
 
 import logging
+from collections.abc import Generator
 from pathlib import Path
-from typing import Generator
 
 from Bio import SeqIO  # type: ignore[import]
 from Bio.SeqRecord import SeqRecord  # type: ignore[import]

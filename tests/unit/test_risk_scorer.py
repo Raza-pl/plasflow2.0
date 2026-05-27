@@ -3,8 +3,6 @@
 Day 19 target: all tests pass.
 """
 
-import pytest
-
 from plasflow2.annotate.args import ARGHit
 from plasflow2.annotate.mobility import MobilityResult
 from plasflow2.risk.scorer import score_plasmid
