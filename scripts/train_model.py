@@ -41,10 +41,9 @@ def train_mlp(X_train, y_train, epochs: int = 50, batch_size: int = 512, lr: flo
     TODO (Day 11): implement training loop with AdamW + cosine LR.
     """
     import torch
-    from torch.utils.data import DataLoader, TensorDataset
-
     from plasflow2.classify.model import PlasFlowMLP
     from plasflow2.utils.device import get_device
+    from torch.utils.data import DataLoader, TensorDataset
 
     device = get_device()
     model = PlasFlowMLP(input_dim=X_train.shape[1]).to(device)
