@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import bz2
 import gzip
 import logging
 import random
@@ -104,10 +105,62 @@ CHROMOSOME_ACCESSIONS = [
 
 
 def _open_fasta(path: Path):
-    """Return a SeqIO iterator for plain or gzipped FASTA."""
+    """Return a SeqIO iterator for plain, gzipped, or bz2-compressed FASTA."""
     if path.suffix == ".gz":
         return SeqIO.parse(gzip.open(path, "rt"), "fasta")
+    if path.suffix == ".bz2":
+        return SeqIO.parse(bz2.open(path, "rt"), "fasta")
     return SeqIO.parse(str(path), "fasta")
+
+
+def fragment_sequences(
+    seqs: list[str],
+    ids: list[str],
+    window_sizes: tuple[int, ...] = (1000, 2000, 5000, 10000),
+    step_fraction: float = 0.5,
+    max_fragments: int | None = None,
+    seed: int = 42,
+) -> tuple[list[str], list[str]]:
+    """Tile complete sequences into contig-sized windows.
+
+    Metagenomic classifiers are trained on assembled contigs, not complete
+    chromosomes. This function simulates that by sliding windows of varying
+    sizes across each input sequence.
+
+    Args:
+        seqs: Complete DNA sequences (e.g. full bacterial chromosomes).
+        ids: Sequence identifiers (same order as seqs).
+        window_sizes: Tuple of window lengths to produce per sequence.
+        step_fraction: Step = window * step_fraction (0.5 = 50% overlap).
+        max_fragments: If set, randomly downsample to this many total fragments.
+        seed: RNG seed for downsampling.
+
+    Returns:
+        Tuple of (fragment_seqs, fragment_ids) — parallel lists of
+        fragment strings and their derived IDs (<parent_id>_w<size>_s<start>).
+    """
+    frag_seqs: list[str] = []
+    frag_ids: list[str] = []
+
+    for parent_id, seq in zip(ids, seqs, strict=True):
+        for w in window_sizes:
+            if w > len(seq):
+                continue
+            step = max(1, int(w * step_fraction))
+            for start in range(0, len(seq) - w + 1, step):
+                fragment = seq[start : start + w]
+                if set(fragment) <= {"A", "C", "G", "T", "N"}:
+                    frag_seqs.append(fragment)
+                    frag_ids.append(f"{parent_id}_w{w}_s{start}")
+
+    if max_fragments is not None and len(frag_seqs) > max_fragments:
+        rng = random.Random(seed)
+        indices = rng.sample(range(len(frag_seqs)), max_fragments)
+        frag_seqs = [frag_seqs[i] for i in indices]
+        frag_ids = [frag_ids[i] for i in indices]
+
+    logger.info("Fragmentation produced %d contig windows", len(frag_seqs))
+    return frag_seqs, frag_ids
 
 
 def load_and_subsample(
@@ -248,11 +301,17 @@ def main() -> None:
     all_labels: list[int] = []
 
     # ── Plasmids ──────────────────────────────────────────────────────────────
-    plsdb_path = data_dir / "plsdb.fna"
-    if not plsdb_path.exists():
-        # Try alternate filename from download script
-        plsdb_path = data_dir / "sequences.fasta"
-    if plsdb_path.exists():
+    # Check multiple possible locations / filenames
+    plsdb_candidates = [
+        data_dir / "plsdb.fna",
+        data_dir / "sequences.fasta",  # manually downloaded from PLSDB site
+        data_dir / "plsdb" / "plsdb.fna",
+        data_dir / "plsdb" / "sequences.fasta",
+        data_dir / "plsdb" / "plsdb.fna.bz2",  # bz2 handled by Biopython
+    ]
+    plsdb_path = next((p for p in plsdb_candidates if p.exists()), None)
+    if plsdb_path is not None:
+        logger.info("Using PLSDB file: %s", plsdb_path)
         seqs, ids, labels = load_and_subsample(
             plsdb_path, "plasmid", args.max_per_class, args.min_length
         )
@@ -260,13 +319,18 @@ def main() -> None:
         all_ids.extend(ids)
         all_labels.extend(labels)
     else:
-        logger.warning("PLSDB not found at %s — skipping plasmid class", plsdb_path)
+        logger.warning("PLSDB not found — checked: %s", [str(p) for p in plsdb_candidates])
 
     # ── Phages ────────────────────────────────────────────────────────────────
-    inphared_path = data_dir / "inphared.fa.gz"
-    if not inphared_path.exists():
-        inphared_path = data_dir / "14Apr2025_genomes.fa.gz"
-    if inphared_path.exists():
+    inphared_candidates = [
+        data_dir / "inphared.fa.gz",
+        data_dir / "14Apr2025_genomes.fa.gz",
+        data_dir / "inphared" / "inphared_phages.fa.gz",
+        data_dir / "inphared" / "14Apr2025_genomes.fa.gz",
+    ]
+    inphared_path = next((p for p in inphared_candidates if p.exists()), None)
+    if inphared_path is not None:
+        logger.info("Using INPHARED file: %s", inphared_path)
         seqs, ids, labels = load_and_subsample(
             inphared_path, "phage", args.max_per_class, args.min_length
         )
@@ -274,19 +338,37 @@ def main() -> None:
         all_ids.extend(ids)
         all_labels.extend(labels)
     else:
-        logger.warning("INPHARED not found at %s — skipping phage class", inphared_path)
+        logger.warning("INPHARED not found — checked: %s", [str(p) for p in inphared_candidates])
 
     # ── Chromosomes ───────────────────────────────────────────────────────────
     chr_path = data_dir / "chromosomes.fna"
     if not args.skip_download:
         download_chromosomes(CHROMOSOME_ACCESSIONS, chr_path)
     if chr_path.exists():
+        # Load all complete chromosomes (no cap — we fragment them next)
         seqs, ids, labels = load_and_subsample(
-            chr_path, "chromosome", args.max_per_class, args.min_length
+            chr_path, "chromosome", max_per_class=10_000_000, min_length=args.min_length
         )
-        all_seqs.extend(seqs)
-        all_ids.extend(ids)
-        all_labels.extend(labels)
+        # Fragment into contig-sized windows and cap at max_per_class
+        if seqs:
+            frag_seqs, frag_ids = fragment_sequences(
+                seqs,
+                ids,
+                window_sizes=(1000, 2000, 5000, 10_000),
+                step_fraction=0.5,
+                max_fragments=args.max_per_class,
+            )
+            chr_label = CLASS_TO_IDX["chromosome"]
+            all_seqs.extend(frag_seqs)
+            all_ids.extend(frag_ids)
+            all_labels.extend([chr_label] * len(frag_seqs))
+            logger.info(
+                "%-12s — kept %d fragments (from %d chromosomes, cap=%d)",
+                "chromosome",
+                len(frag_seqs),
+                len(seqs),
+                args.max_per_class,
+            )
     else:
         logger.warning("Chromosome FASTA not found — skipping chromosome class")
 
