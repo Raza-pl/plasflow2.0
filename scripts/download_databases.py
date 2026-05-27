@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import subprocess
 import sys
 import urllib.request
 from pathlib import Path
@@ -29,7 +28,9 @@ BASE_DIR = Path(__file__).parent.parent / "data" / "databases"
 # ---------------------------------------------------------------------------
 DATABASES: dict[str, dict] = {
     "PLSDB": {
-        "url": "https://ccb-microbe.cs.uni-saarland.de/plsdb/plasmids/download/plsdb.fna.bz2",
+        # PLSDB 2025 — visit https://www.ccb.uni-saarland.de/plsdb2025 to get current download link
+        # The site moved from ccb-microbe.cs.uni-saarland.de to ccb.uni-saarland.de
+        "url": "https://www.ccb.uni-saarland.de/plsdb2025/plasmids/download/plsdb.fna.bz2",
         "dest": BASE_DIR / "plsdb" / "plsdb.fna.bz2",
         "md5": None,  # TODO: fill in after first download
         "size_hint": "~8 GB compressed",
@@ -42,7 +43,9 @@ DATABASES: dict[str, dict] = {
         "size_hint": "~300 MB",
     },
     "INPHARED": {
-        "url": "https://millardlab-inphared.s3.climb.ac.uk/1Sep2023_phages_downloaded_from_genbank.fa.gz",
+        # Latest release: April 2025 — update date prefix when a newer release is available
+        # Full list at https://github.com/RyanCook94/inphared
+        "url": "https://millardlab-inphared.s3.climb.ac.uk/14Apr2025_genomes.fa.gz",
         "dest": BASE_DIR / "inphared" / "inphared_phages.fa.gz",
         "md5": None,
         "size_hint": "~30k genomes",

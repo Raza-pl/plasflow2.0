@@ -5,7 +5,6 @@ Week 3 — Day 17 implementation target.
 
 from __future__ import annotations
 
-import json
 import logging
 import subprocess
 from dataclasses import dataclass
@@ -19,10 +18,10 @@ class MobilityResult:
     """MOB-suite mob_typer output for one plasmid contig."""
 
     contig_id: str
-    mobility_class: str    # conjugative | mobilizable | non-mobilizable
-    replicon_type: str     # e.g., IncF, IncP, IncQ, unknown
-    relaxase_type: str     # MOB family or "none"
-    mpf_type: str          # Mating pair formation system or "none"
+    mobility_class: str  # conjugative | mobilizable | non-mobilizable
+    replicon_type: str  # e.g., IncF, IncP, IncQ, unknown
+    relaxase_type: str  # MOB family or "none"
+    mpf_type: str  # Mating pair formation system or "none"
 
 
 def run_mob_typer(
@@ -51,9 +50,12 @@ def run_mob_typer(
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         "mob_typer",
-        "--infile", str(plasmid_fasta),
-        "--out_file", str(out_dir / "mobtyper_results.txt"),
-        "--num_threads", str(threads),
+        "--infile",
+        str(plasmid_fasta),
+        "--out_file",
+        str(out_dir / "mobtyper_results.txt"),
+        "--num_threads",
+        str(threads),
     ]
     logger.info("Running mob_typer: %s", " ".join(cmd))
     subprocess.run(cmd, check=True)

@@ -13,8 +13,8 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # DIAMOND hit filters (per plan)
-MIN_IDENTITY = 90.0   # %
-MIN_COVERAGE = 80.0   # %
+MIN_IDENTITY = 90.0  # %
+MIN_COVERAGE = 80.0  # %
 
 
 @dataclass
@@ -25,8 +25,8 @@ class ARGHit:
     gene_name: str
     amr_family: str
     drug_class: str
-    identity: float     # %
-    coverage: float     # % query coverage
+    identity: float  # %
+    coverage: float  # % query coverage
     evalue: float
 
 
@@ -54,15 +54,28 @@ def run_diamond(
     """
     out_tsv.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
-        "diamond", "blastp",
-        "--query", str(protein_fasta),
-        "--db", str(card_db),
-        "--out", str(out_tsv),
-        "--outfmt", "6",
-        "qseqid", "sseqid", "pident", "qcovhsp", "evalue", "stitle",
-        "--id", str(MIN_IDENTITY),
-        "--query-cover", str(MIN_COVERAGE),
-        "--threads", str(threads),
+        "diamond",
+        "blastp",
+        "--query",
+        str(protein_fasta),
+        "--db",
+        str(card_db),
+        "--out",
+        str(out_tsv),
+        "--outfmt",
+        "6",
+        "qseqid",
+        "sseqid",
+        "pident",
+        "qcovhsp",
+        "evalue",
+        "stitle",
+        "--id",
+        str(MIN_IDENTITY),
+        "--query-cover",
+        str(MIN_COVERAGE),
+        "--threads",
+        str(threads),
         "--sensitive",
     ]
     logger.info("Running DIAMOND: %s", " ".join(cmd))

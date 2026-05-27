@@ -120,6 +120,7 @@ def generate_report(
     """
     try:
         from jinja2 import Environment  # type: ignore[import]
+
         env = Environment()
         env.filters["tojson"] = json.dumps
         tmpl = env.from_string(_TEMPLATE)

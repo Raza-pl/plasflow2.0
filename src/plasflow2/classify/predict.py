@@ -11,10 +11,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from numpy.typing import NDArray
 
 from plasflow2.classify.features import extract_features
-from plasflow2.classify.model import PlasFlowMLP, load_model
+from plasflow2.classify.model import load_model
 from plasflow2.utils.device import IDX_TO_CLASS, get_device
 
 logger = logging.getLogger(__name__)
@@ -28,8 +27,8 @@ class Prediction:
     """Single-sequence prediction result."""
 
     sequence_id: str
-    label: str          # plasmid | chromosome | phage | archaea | unclassified
-    confidence: float   # max softmax probability (after temperature scaling)
+    label: str  # plasmid | chromosome | phage | archaea | unclassified
+    confidence: float  # max softmax probability (after temperature scaling)
     scores: dict[str, float]  # per-class probabilities
 
 

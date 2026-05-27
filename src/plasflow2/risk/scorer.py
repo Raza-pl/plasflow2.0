@@ -28,7 +28,7 @@ class RiskScore:
     """AMR risk assessment for a single plasmid contig."""
 
     contig_id: str
-    score: int                      # 0–10 (capped)
+    score: int  # 0–10 (capped)
     evidence: list[str] = field(default_factory=list)  # human-readable justifications
 
     # Subscores (for transparency / report detail)
