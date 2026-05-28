@@ -154,6 +154,7 @@ def _write_annotations_json(plasmid_results: list, output_path: Path) -> None:
                         "identity": h.identity,
                         "coverage": h.coverage,
                         "evalue": h.evalue,
+                        "source": h.source,
                     }
                     for h in cr.arg_hits
                 ],
@@ -271,6 +272,17 @@ def main(ctx: click.Context, verbose: bool) -> None:
     default=False,
     help="Skip taxonomy annotation (use when no taxonomy DB is available).",
 )
+@click.option(
+    "--sarg-db",
+    "sarg_db",
+    default=None,
+    type=click.Path(),
+    help=(
+        "DIAMOND database (.dmnd) built from the SARG (Structured ARG) database. "
+        "When provided, ARG annotation runs against both CARD and SARG; CARD hits "
+        "take precedence per ORF and SARG supplements with genes not found in CARD."
+    ),
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -287,6 +299,7 @@ def run(
     taxonomy_db: str | None,
     taxon_map: str | None,
     skip_taxonomy: bool,
+    sarg_db: str | None,
 ) -> None:
     """Run the full PlasFlow v2 pipeline: classify → annotate → risk → report.
 
@@ -325,6 +338,7 @@ def run(
         taxonomy_db=taxonomy_db,
         taxon_map_path=taxon_map,
         skip_taxonomy=skip_taxonomy,
+        sarg_db=sarg_db,
     )
 
     # --- Write predictions TSV (all contigs) ---
@@ -444,6 +458,13 @@ def classify(
     default=False,
     help="Skip mob_typer mobility typing.",
 )
+@click.option(
+    "--sarg-db",
+    "sarg_db",
+    default=None,
+    type=click.Path(),
+    help="DIAMOND database (.dmnd) built from SARG for dual-DB ARG annotation.",
+)
 @click.pass_context
 def annotate(
     ctx: click.Context,
@@ -453,8 +474,9 @@ def annotate(
     aro_index: str | None,
     threads: int,
     skip_mobility: bool,
+    sarg_db: str | None,
 ) -> None:
-    """Annotate plasmid sequences with ARGs (DIAMOND/CARD) and mobility (MOB-suite)."""
+    """Annotate plasmid sequences with ARGs (DIAMOND/CARD+SARG) and mobility (MOB-suite)."""
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -465,15 +487,19 @@ def annotate(
         if not p.exists():
             raise click.BadParameter(f"Not found: {p}", param_hint=name)
 
-    click.echo(f"Annotating ARGs on {input_fasta} …")
+    db_label = "CARD + SARG" if sarg_db else "CARD"
+    click.echo(f"Annotating ARGs on {input_fasta} ({db_label}) …")
     arg_hits = annotate_contigs(
         fasta_path=input_fasta,
         card_db=card_db_path,
         aro_index_path=aro_index_path,
         work_dir=out / "arg_work",
         threads=threads,
+        sarg_db=sarg_db,
     )
-    click.echo(f"  {len(arg_hits)} ARG hits detected")
+    card_n = sum(1 for h in arg_hits if h.source == "CARD")
+    sarg_n = sum(1 for h in arg_hits if h.source == "SARG")
+    click.echo(f"  {len(arg_hits)} ARG hits detected (CARD: {card_n}, SARG: {sarg_n})")
 
     mobility_results = []
     if not skip_mobility:
@@ -516,10 +542,13 @@ def annotate(
                     {
                         "gene_name": h.gene_name,
                         "aro_accession": h.aro_accession,
+                        "amr_family": h.amr_family,
                         "drug_class": h.drug_class,
+                        "resistance_mechanism": h.resistance_mechanism,
                         "identity": h.identity,
                         "coverage": h.coverage,
                         "evalue": h.evalue,
+                        "source": h.source,
                     }
                     for h in hits
                 ],
@@ -614,6 +643,7 @@ def report_cmd(
                 identity=h["identity"],
                 coverage=h["coverage"],
                 evalue=h["evalue"],
+                source=h.get("source", "CARD"),
             )
             for h in rec.get("arg_hits", [])
         ]

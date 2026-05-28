@@ -3,7 +3,7 @@
 [![CI](https://github.com/Raza-pl/plasflow2.0/actions/workflows/ci.yml/badge.svg)](https://github.com/Raza-pl/plasflow2.0/actions)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Tests](https://img.shields.io/badge/tests-175%20passing-brightgreen.svg)](#development)
+[![Tests](https://img.shields.io/badge/tests-204%20passing-brightgreen.svg)](#development)
 
 **PlasFlow v2** classifies metagenomic contigs as plasmid, chromosome, phage, or archaea, annotates antibiotic resistance genes (ARGs) via CARD, determines mobility class with MOB-suite, assigns taxonomy via DIAMOND + GTDB LCA, scores AMR risk (0–10), and produces an interactive HTML report — all in one command.
 
@@ -18,7 +18,7 @@ This is a full rewrite of [PlasFlow v1](https://github.com/smaegol/PlasFlow) (Kr
 | Python version | 3.5 / TensorFlow 0.10 | 3.10+ / PyTorch 2.x |
 | Classes | plasmid vs chromosome | plasmid · chromosome · **phage** · **archaea** |
 | Architecture | TF neural net | **4-class MLP (97.4% accuracy)** + Random Forest |
-| ARG annotation | ✗ | DIAMOND + CARD |
+| ARG annotation | ✗ | DIAMOND + CARD + **SARG** (dual-DB) |
 | Mobility typing | ✗ | MOB-suite (conjugative / mobilizable / non-mobilizable) |
 | Taxonomy | ✗ | **DIAMOND + GTDB LCA (Kaiju-style)** per contig |
 | AMR risk score | ✗ | 0–10 score with evidence breakdown |
@@ -223,6 +223,7 @@ Options for plasflow2 run:
   --model             Path to .pt model weights
   --card-db           CARD DIAMOND database (.dmnd)
   --aro-index         CARD ARO index (aro_index.tsv)
+  --sarg-db           SARG DIAMOND database (.dmnd) for dual-DB ARG annotation
   --taxonomy-db       DIAMOND database built from GTDB-r220 / RefSeq proteins
   --taxon-map         2-column accession→lineage TSV (improves LCA accuracy)
   --threshold         Confidence threshold, default 0.7
@@ -249,6 +250,36 @@ Each contig is annotated with its lowest common ancestor (LCA) taxon using DIAMO
 | `--skip-taxonomy` | False | Skip the step entirely |
 
 Taxonomy is stored per-contig in `annotations.json` (`lineage`, `rank`, `taxon`, `agreement`) and shown as the "Taxonomy (LCA)" column in the HTML report.
+
+---
+
+## ARG annotation (CARD + SARG)
+
+PlasFlow v2 annotates antibiotic resistance genes using DIAMOND BLASTp against one or both databases:
+
+**CARD** (Comprehensive Antibiotic Resistance Database) is the default — strict thresholds (90% identity, 80% coverage), rich metadata (ARO accession, AMR family, resistance mechanism).
+
+**SARG** (Structured ARG database) is optional (`--sarg-db`) — looser thresholds (80% identity, 80% coverage), captures more divergent homologues not represented in CARD. When both are enabled, CARD hits take precedence per ORF and SARG contributes supplementary hits for genes only found in SARG.
+
+The DB source (CARD / SARG) is shown as a colour-coded badge in the HTML report and serialised as a `source` field in `annotations.json`.
+
+**SARG setup (one-time):**
+```bash
+# Download SARG FASTA from https://smile.hku.hk/SARGs
+mkdir -p data/databases/sarg
+diamond makedb --in sarg.fasta -d data/databases/sarg/sarg
+```
+
+**Run with dual-DB annotation:**
+```bash
+plasflow2 run \
+  --input        assembly.fasta \
+  --output       ./results/ \
+  --card-db      data/databases/card/card.dmnd \
+  --aro-index    data/databases/card/aro_index.tsv \
+  --sarg-db      data/databases/sarg/sarg.dmnd \
+  --threads      8
+```
 
 ---
 

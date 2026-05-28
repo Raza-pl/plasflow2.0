@@ -1,6 +1,7 @@
 """Unit tests for ARG annotation (annotate/args.py).
 
-All tests use synthetic data — no DIAMOND, pyrodigal, or CARD files required.
+Covers both CARD-only and dual CARD+SARG annotation paths.
+All tests use synthetic data — no DIAMOND, pyrodigal, or database files required.
 """
 
 from __future__ import annotations
@@ -8,13 +9,18 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from plasflow2.annotate.args import load_card_metadata, parse_diamond_hits
+from plasflow2.annotate.args import (
+    ARGHit,
+    load_card_metadata,
+    merge_arg_hits,
+    parse_diamond_hits,
+    parse_sarg_hits,
+)
 
 # ---------------------------------------------------------------------------
-# Fixtures / helpers
+# Fixtures / helpers — CARD
 # ---------------------------------------------------------------------------
 
-# Minimal synthetic aro_index.tsv content matching real CARD column names
 _ARO_INDEX_HEADER = (
     "ARO Accession\tCVTERM ID\tModel Sequence ID\tModel ID\tModel Name\t"
     "ARO Name\tProtein Accession\tDNA Accession\tAMR Gene Family\t"
@@ -53,6 +59,30 @@ def _write_aro_index(path: Path) -> None:
 
 def _write_diamond_tsv(path: Path, lines: list[str] | None = None) -> None:
     path.write_text("".join(lines or _DIAMOND_TSV_LINES))
+
+
+# ---------------------------------------------------------------------------
+# Fixtures / helpers — SARG
+# ---------------------------------------------------------------------------
+
+# SARG DIAMOND output: sseqid has pipe-delimited acc|type|subtype|gene
+_SARG_TSV_LINES = [
+    # mcr-1 — polymyxin resistance, not in CARD synthetic set
+    "contigC_2\tEc_mcr1_NG050715.1_1|polymyxin|MCR|mcr-1\t85.0\t82.0\t2e-60\t"
+    "Ec_mcr1_NG050715.1_1|polymyxin|MCR|mcr-1 mobile colistin resistance\n",
+    # aph(6)-Id — aminoglycoside, SARG-only contig
+    "contigD_1\tAY123456_1|aminoglycoside|APH(6)|aph(6)-Id\t88.5\t90.0\t3e-75\t"
+    "AY123456_1|aminoglycoside|APH(6)|aph(6)-Id aminoglycoside phosphotransferase\n",
+    # Same ORF as CARD contigA_1 — should be deduplicated in favour of CARD
+    "contigA_1\tSARG_NDM|beta-lactam|NDM|NDM-1\t81.0\t80.0\t5e-40\t"
+    "SARG_NDM|beta-lactam|NDM|NDM-1\n",
+    # Malformed — skip
+    "bad\n",
+]
+
+
+def _write_sarg_tsv(path: Path, lines: list[str] | None = None) -> None:
+    path.write_text("".join(lines or _SARG_TSV_LINES))
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +135,7 @@ def test_load_card_metadata_empty_file(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# parse_diamond_hits
+# parse_diamond_hits (CARD)
 # ---------------------------------------------------------------------------
 
 
@@ -178,3 +208,277 @@ def test_parse_hits_unknown_aro_fallback(tmp_path: Path) -> None:
     assert len(hits) == 1
     assert hits[0].aro_accession == "unknown"
     assert hits[0].contig_id == "contigX"
+
+
+def test_parse_hits_source_is_card(tmp_path: Path) -> None:
+    """All hits from parse_diamond_hits should have source='CARD'."""
+    tsv = tmp_path / "diamond.tsv"
+    _write_diamond_tsv(tsv)
+    hits = parse_diamond_hits(tsv)
+    assert all(h.source == "CARD" for h in hits)
+
+
+# ---------------------------------------------------------------------------
+# parse_sarg_hits
+# ---------------------------------------------------------------------------
+
+
+def test_parse_sarg_hits_count(tmp_path: Path) -> None:
+    tsv = tmp_path / "sarg.tsv"
+    _write_sarg_tsv(tsv)
+    hits = parse_sarg_hits(tsv)
+    # 3 valid lines (mcr-1, aph, and contigA_1 duplicate), 1 malformed
+    assert len(hits) == 3
+
+
+def test_parse_sarg_hits_source(tmp_path: Path) -> None:
+    """All hits from parse_sarg_hits should have source='SARG'."""
+    tsv = tmp_path / "sarg.tsv"
+    _write_sarg_tsv(tsv)
+    hits = parse_sarg_hits(tsv)
+    assert all(h.source == "SARG" for h in hits)
+
+
+def test_parse_sarg_hits_drug_class_from_header(tmp_path: Path) -> None:
+    """Drug class should be extracted from the pipe-delimited SARG header."""
+    tsv = tmp_path / "sarg.tsv"
+    _write_sarg_tsv(tsv)
+    hits = parse_sarg_hits(tsv)
+    # mcr-1 → polymyxin; aph → aminoglycoside
+    drug_classes = {h.drug_class for h in hits}
+    assert "polymyxin" in drug_classes
+    assert "aminoglycoside" in drug_classes
+
+
+def test_parse_sarg_hits_gene_name(tmp_path: Path) -> None:
+    """Gene name should be extracted from the last pipe field."""
+    tsv = tmp_path / "sarg.tsv"
+    _write_sarg_tsv(tsv)
+    hits = parse_sarg_hits(tsv)
+    gene_names = {h.gene_name for h in hits}
+    assert "mcr-1" in gene_names
+    assert "aph(6)-Id" in gene_names
+
+
+def test_parse_sarg_hits_amr_family_is_subtype(tmp_path: Path) -> None:
+    """amr_family should be the SARG subtype field."""
+    tsv = tmp_path / "sarg.tsv"
+    _write_sarg_tsv(tsv)
+    hits = parse_sarg_hits(tsv)
+    subtypes = {h.amr_family for h in hits}
+    assert "MCR" in subtypes
+    assert "APH(6)" in subtypes
+
+
+def test_parse_sarg_hits_contig_strips_orf_suffix(tmp_path: Path) -> None:
+    tsv = tmp_path / "sarg.tsv"
+    _write_sarg_tsv(tsv)
+    hits = parse_sarg_hits(tsv)
+    contig_ids = {h.contig_id for h in hits}
+    assert "contigC" in contig_ids
+    assert "contigD" in contig_ids
+
+
+def test_parse_sarg_hits_empty_file(tmp_path: Path) -> None:
+    tsv = tmp_path / "sarg.tsv"
+    tsv.write_text("")
+    hits = parse_sarg_hits(tsv)
+    assert hits == []
+
+
+def test_parse_sarg_hits_fallback_no_pipes(tmp_path: Path) -> None:
+    """sseqid without pipe delimiters should not crash — falls back gracefully."""
+    tsv = tmp_path / "sarg.tsv"
+    tsv.write_text("contigZ_1\tnopipes\t82.0\t85.0\t1e-30\tnopipes description\n")
+    hits = parse_sarg_hits(tsv)
+    assert len(hits) == 1
+    assert hits[0].gene_name == "nopipes"
+    assert hits[0].drug_class == "unknown"
+    assert hits[0].source == "SARG"
+
+
+# ---------------------------------------------------------------------------
+# merge_arg_hits
+# ---------------------------------------------------------------------------
+
+
+def test_merge_card_preferred_per_orf(tmp_path: Path) -> None:
+    """If same ORF appears in both CARD and SARG, the CARD hit is kept."""
+    card = [
+        ARGHit(
+            contig_id="contigA",
+            gene_name="NDM-6",
+            aro_accession="ARO:3002356",
+            amr_family="NDM beta-lactamase",
+            drug_class="carbapenem antibiotic",
+            resistance_mechanism="antibiotic inactivation",
+            identity=99.5,
+            coverage=95.0,
+            evalue=1e-120,
+            source="CARD",
+            _orf_id="contigA_1",
+        )
+    ]
+    sarg = [
+        ARGHit(
+            contig_id="contigA",
+            gene_name="NDM-1",
+            aro_accession="SARG_NDM",
+            amr_family="NDM",
+            drug_class="beta-lactam",
+            resistance_mechanism="unknown",
+            identity=81.0,
+            coverage=80.0,
+            evalue=5e-40,
+            source="SARG",
+            _orf_id="contigA_1",  # same ORF → should be dropped
+        )
+    ]
+    merged = merge_arg_hits(card, sarg)
+    assert len(merged) == 1
+    assert merged[0].source == "CARD"
+    assert merged[0].gene_name == "NDM-6"
+
+
+def test_merge_sarg_only_supplemented(tmp_path: Path) -> None:
+    """SARG hits for ORFs not found by CARD are added to the merged list."""
+    card = [
+        ARGHit(
+            contig_id="contigA",
+            gene_name="NDM-6",
+            aro_accession="ARO:3002356",
+            amr_family="NDM beta-lactamase",
+            drug_class="carbapenem antibiotic",
+            resistance_mechanism="antibiotic inactivation",
+            identity=99.5,
+            coverage=95.0,
+            evalue=1e-120,
+            source="CARD",
+            _orf_id="contigA_1",
+        )
+    ]
+    sarg = [
+        ARGHit(
+            contig_id="contigB",
+            gene_name="mcr-1",
+            aro_accession="Ec_mcr1",
+            amr_family="MCR",
+            drug_class="polymyxin",
+            resistance_mechanism="unknown",
+            identity=85.0,
+            coverage=82.0,
+            evalue=2e-60,
+            source="SARG",
+            _orf_id="contigB_1",  # different ORF — should be kept
+        )
+    ]
+    merged = merge_arg_hits(card, sarg)
+    assert len(merged) == 2
+    sources = {h.source for h in merged}
+    assert "CARD" in sources
+    assert "SARG" in sources
+
+
+def test_merge_empty_sarg(tmp_path: Path) -> None:
+    """merge_arg_hits with empty SARG list returns all CARD hits unchanged."""
+    card = [
+        ARGHit(
+            contig_id="contigA",
+            gene_name="NDM-6",
+            aro_accession="ARO:3002356",
+            amr_family="NDM beta-lactamase",
+            drug_class="carbapenem antibiotic",
+            resistance_mechanism="antibiotic inactivation",
+            identity=99.5,
+            coverage=95.0,
+            evalue=1e-120,
+            source="CARD",
+            _orf_id="contigA_1",
+        )
+    ]
+    merged = merge_arg_hits(card, [])
+    assert merged == card
+
+
+def test_merge_empty_card(tmp_path: Path) -> None:
+    """merge_arg_hits with empty CARD list returns all SARG hits."""
+    sarg = [
+        ARGHit(
+            contig_id="contigC",
+            gene_name="mcr-1",
+            aro_accession="Ec_mcr1",
+            amr_family="MCR",
+            drug_class="polymyxin",
+            resistance_mechanism="unknown",
+            identity=85.0,
+            coverage=82.0,
+            evalue=2e-60,
+            source="SARG",
+            _orf_id="contigC_2",
+        )
+    ]
+    merged = merge_arg_hits([], sarg)
+    assert len(merged) == 1
+    assert merged[0].source == "SARG"
+
+
+def test_merge_both_empty() -> None:
+    assert merge_arg_hits([], []) == []
+
+
+def test_merge_preserves_order(tmp_path: Path) -> None:
+    """CARD hits come first; SARG-only appended in their original order."""
+    card = [
+        ARGHit(
+            contig_id=f"c{i}",
+            gene_name=f"gene{i}",
+            aro_accession=f"ARO:{i}",
+            amr_family="fam",
+            drug_class="dc",
+            resistance_mechanism="inactivation",
+            identity=95.0,
+            coverage=90.0,
+            evalue=1e-50,
+            source="CARD",
+            _orf_id=f"c{i}_1",
+        )
+        for i in range(3)
+    ]
+    sarg = [
+        ARGHit(
+            contig_id=f"s{i}",
+            gene_name=f"sarg{i}",
+            aro_accession=f"S{i}",
+            amr_family="fam",
+            drug_class="dc",
+            resistance_mechanism="unknown",
+            identity=82.0,
+            coverage=80.0,
+            evalue=1e-30,
+            source="SARG",
+            _orf_id=f"s{i}_1",
+        )
+        for i in range(2)
+    ]
+    merged = merge_arg_hits(card, sarg)
+    assert [h.source for h in merged] == ["CARD", "CARD", "CARD", "SARG", "SARG"]
+
+
+# ---------------------------------------------------------------------------
+# ARGHit.source default
+# ---------------------------------------------------------------------------
+
+
+def test_arg_hit_default_source() -> None:
+    hit = ARGHit(
+        contig_id="c",
+        gene_name="g",
+        aro_accession="ARO:1",
+        amr_family="fam",
+        drug_class="dc",
+        resistance_mechanism="inactivation",
+        identity=95.0,
+        coverage=90.0,
+        evalue=1e-50,
+    )
+    assert hit.source == "CARD"

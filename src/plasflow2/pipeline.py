@@ -106,6 +106,7 @@ def run_pipeline(
     taxonomy_db: Path | str | None = None,
     taxon_map_path: Path | str | None = None,
     skip_taxonomy: bool = False,
+    sarg_db: Path | str | None = None,
 ) -> PipelineResult:
     """Run the full PlasFlow v2 pipeline on a FASTA file.
 
@@ -142,6 +143,10 @@ def run_pipeline(
             extracted from DIAMOND ``stitle`` fields.
         skip_taxonomy: If True, skip taxonomy annotation entirely (useful when
             no GTDB/RefSeq database is available).
+        sarg_db: Optional path to a DIAMOND .dmnd database built from the SARG
+            (Structured ARG) database.  When provided, ARG annotation runs
+            against both CARD and SARG; CARD hits are preferred per ORF and
+            SARG contributes supplementary hits for genes not in CARD.
 
     Returns:
         :class:`PipelineResult` with all predictions and per-plasmid
@@ -217,13 +222,18 @@ def run_pipeline(
     # ------------------------------------------------------------------
     # 4. ARG annotation
     # ------------------------------------------------------------------
-    logger.info("Annotating ARGs on %d plasmid contigs …", len(plasmid_records))
+    logger.info(
+        "Annotating ARGs on %d plasmid contigs (CARD%s) …",
+        len(plasmid_records),
+        " + SARG" if sarg_db else "",
+    )
     arg_hits = annotate_contigs(
         fasta_path=plasmid_fasta,
         card_db=card_db,
         aro_index_path=aro_index,
         work_dir=work_dir / "arg_annotation",
         threads=threads,
+        sarg_db=sarg_db,
     )
     # Group hits by contig_id for fast lookup
     args_by_contig: dict[str, list[ARGHit]] = {}

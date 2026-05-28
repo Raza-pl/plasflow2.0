@@ -60,6 +60,10 @@ _TEMPLATE = """<!DOCTYPE html>
     .risk-high   { color: #c0392b; font-weight: bold; }
     .risk-medium { color: #e67e22; font-weight: bold; }
     .risk-low    { color: #27ae60; font-weight: bold; }
+    .src-badge   { display: inline-block; padding: 1px 7px; border-radius: 10px;
+                   font-size: .75rem; font-weight: 600; margin: 1px 2px; }
+    .src-card    { background: #e8f0fe; color: #1a56db; }
+    .src-sarg    { background: #fef3c7; color: #b45309; }
     .filter-bar  { margin: 12px 0 8px; display: flex; gap: 8px; align-items: center; }
     .filter-btn  { padding: 6px 16px; border: none; border-radius: 20px; cursor: pointer;
                    font-size: 0.85rem; font-weight: 600; transition: opacity .15s; }
@@ -133,6 +137,7 @@ _TEMPLATE = """<!DOCTYPE html>
         <th>Confidence</th>
         <th>ARGs</th>
         <th>Drug Classes</th>
+        <th>DB Source</th>
         <th>Mobility</th>
         <th>Replicon</th>
         <th>Risk Score</th>
@@ -148,6 +153,13 @@ _TEMPLATE = """<!DOCTYPE html>
         <td>{{ "%.3f" | format(row.confidence) }}</td>
         <td>{{ row.num_args }}</td>
         <td>{{ row.drug_classes }}</td>
+        <td>
+          {% for src in row.arg_sources.split(', ') if src %}
+            <span class="src-badge src-{{ src | lower }}">{{ src }}</span>
+          {% else %}
+            —
+          {% endfor %}
+        </td>
         <td>{{ row.mobility_class }}</td>
         <td>{{ row.replicon_type }}</td>
         <td class="{% if row.risk_score >= 7 %}risk-high{% elif row.risk_score >= 4 %}risk-medium{% else %}risk-low{% endif %}">
@@ -241,6 +253,8 @@ class PlasmidRow:
     risk_score: int
     taxonomy: str  # LCA display string, e.g. "genus: g__Klebsiella"
     risk_evidence: str  # semicolon-separated evidence strings
+    # Comma-separated set of databases that contributed hits, e.g. "CARD" or "CARD, SARG"
+    arg_sources: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +594,10 @@ def build_report_data(pipeline_result, input_file: str = "") -> dict:
         tax = getattr(cr, "taxonomy", None) or taxonomy.get(cr.record.id)
         tax_display = tax.display if tax else "—"
 
+        # Collect distinct DB sources for this contig's ARG hits
+        sources = sorted({h.source for h in cr.arg_hits if hasattr(h, "source") and h.source})
+        arg_sources = ", ".join(sources) if sources else ""
+
         plasmid_rows.append(
             PlasmidRow(
                 contig_id=cr.record.id,
@@ -592,6 +610,7 @@ def build_report_data(pipeline_result, input_file: str = "") -> dict:
                 risk_score=cr.risk.score,
                 taxonomy=tax_display,
                 risk_evidence="; ".join(cr.risk.evidence) if cr.risk.evidence else "—",
+                arg_sources=arg_sources,
             )
         )
 

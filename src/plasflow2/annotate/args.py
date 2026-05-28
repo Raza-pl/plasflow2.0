@@ -1,13 +1,22 @@
-"""ARG (Antibiotic Resistance Gene) detection via DIAMOND + CARD.
+"""ARG (Antibiotic Resistance Gene) detection via DIAMOND + CARD and/or SARG.
 
-Week 3 — Days 15–16 implementation.
+Pipeline (CARD-only):
+    FASTA → call_orfs() → proteins.faa → run_diamond(card_db) → TSV
+          → parse_diamond_hits() → [ARGHit(source="CARD")]
 
-Pipeline:
-    FASTA → call_orfs() → protein FASTA → run_diamond() → TSV
-         → parse_diamond_hits() → [ARGHit]
+Pipeline (CARD + SARG dual):
+    FASTA → call_orfs() → proteins.faa
+          → run_diamond(card_db)  → card_hits.tsv  → parse_diamond_hits()
+          → run_diamond(sarg_db)  → sarg_hits.tsv  → parse_sarg_hits()
+          → merge_arg_hits()      → deduplicated [ARGHit] (CARD preferred per ORF)
 
-CARD database setup (one-time):
-    python -c "from plasflow2.annotate.args import setup_card_db; setup_card_db('data/databases/card')"
+Database setup (one-time):
+    # CARD
+    python -c "from plasflow2.annotate.args import setup_card_db; \\
+               setup_card_db('data/databases/card')"
+
+    # SARG — download from https://smile.hku.hk/SARGs, then:
+    diamond makedb --in sarg.fasta -d data/databases/sarg/sarg
 """
 
 from __future__ import annotations
@@ -17,18 +26,37 @@ import logging
 import re
 import subprocess
 import tarfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-# DIAMOND hit filters (per plan §2.1)
-MIN_IDENTITY = 90.0  # % amino-acid identity
-MIN_COVERAGE = 80.0  # % query coverage
+# ---------------------------------------------------------------------------
+# DIAMOND hit filters
+# ---------------------------------------------------------------------------
 
-# Regex to extract fields from CARD FASTA header / DIAMOND sseqid
-# Header format: gb|PROT_ACC|ARO:XXXXX|GENE_NAME [Organism]
+# CARD: strict — well-characterised reference sequences
+CARD_MIN_IDENTITY = 90.0
+CARD_MIN_COVERAGE = 80.0
+
+# SARG: slightly looser — broader database, captures more divergent homologues
+SARG_MIN_IDENTITY = 80.0
+SARG_MIN_COVERAGE = 80.0
+
+# ---------------------------------------------------------------------------
+# Header regexes
+# ---------------------------------------------------------------------------
+
+# CARD sseqid format:  gb|PROT_ACC|ARO:XXXXX|GENE_NAME [Organism]
 _CARD_SSEQID_RE = re.compile(r"gb\|(?P<prot_acc>[^|]+)\|(?P<aro>ARO:\d+)\|(?P<gene>[^\s\[]+)")
+
+# SARG sseqid format:  acc|Type|Subtype|Gene_name
+# e.g.  Ec_mcr1_NG050715.1_1|polymyxin|MCR|mcr-1
+#       AY123456_1|beta-lactam|NDM|NDM-1
+_SARG_SSEQID_RE = re.compile(
+    r"(?P<acc>[^|]+)\|(?P<drug_type>[^|]+)\|(?P<subtype>[^|]+)\|(?P<gene>[^|\s]+)"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -38,17 +66,20 @@ _CARD_SSEQID_RE = re.compile(r"gb\|(?P<prot_acc>[^|]+)\|(?P<aro>ARO:\d+)\|(?P<ge
 
 @dataclass
 class ARGHit:
-    """Single DIAMOND hit against CARD, annotated with resistance metadata."""
+    """Single DIAMOND hit against CARD or SARG, annotated with resistance metadata."""
 
     contig_id: str
-    gene_name: str  # e.g. "NDM-6", "TEM-1"
-    aro_accession: str  # e.g. "ARO:3002356"
-    amr_family: str  # e.g. "NDM beta-lactamase"
+    gene_name: str  # e.g. "NDM-6", "TEM-1", "mcr-1"
+    aro_accession: str  # ARO:XXXXXX for CARD hits; SARG acc for SARG hits
+    amr_family: str  # e.g. "NDM beta-lactamase" / SARG subtype
     drug_class: str  # e.g. "carbapenem antibiotic; cephalosporin"
     resistance_mechanism: str  # e.g. "antibiotic inactivation"
     identity: float  # % amino-acid identity
     coverage: float  # % query coverage
     evalue: float
+    source: Literal["CARD", "SARG"] = "CARD"
+    # Internal: ORF id used for deduplication, not exposed in reports
+    _orf_id: str = field(default="", repr=False, compare=False)
 
 
 @dataclass
@@ -113,7 +144,14 @@ def setup_card_db(card_dir: Path | str, force: bool = False) -> tuple[Path, Path
     if force or not diamond_db.exists():
         logger.info("Building DIAMOND database from %s …", protein_fasta)
         subprocess.run(
-            ["diamond", "makedb", "--in", str(protein_fasta), "-d", str(card_dir / "card")],
+            [
+                "diamond",
+                "makedb",
+                "--in",
+                str(protein_fasta),
+                "-d",
+                str(card_dir / "card"),
+            ],
             check=True,
         )
         logger.info("DIAMOND database written to %s", diamond_db)
@@ -128,7 +166,7 @@ def setup_card_db(card_dir: Path | str, force: bool = False) -> tuple[Path, Path
 # ---------------------------------------------------------------------------
 
 
-def load_card_metadata(aro_index_path: Path | str) -> dict[str, dict]:
+def load_card_metadata(aro_index_path: Path | str) -> dict[str, dict]:  # type: ignore[type-arg]
     """Load CARD aro_index.tsv into a dict keyed by ARO accession.
 
     Args:
@@ -137,14 +175,13 @@ def load_card_metadata(aro_index_path: Path | str) -> dict[str, dict]:
     Returns:
         Dict mapping "ARO:XXXXXX" → {gene, family, drug_class, mechanism}.
     """
-    metadata: dict[str, dict] = {}
+    metadata: dict[str, dict] = {}  # type: ignore[type-arg]
     with open(aro_index_path, newline="") as fh:
         reader = csv.DictReader(fh, delimiter="\t")
         for row in reader:
             aro = row.get("ARO Accession", "").strip()
             if not aro:
                 continue
-            # Drug class field may contain semicolon-separated values
             drug_classes = [d.strip() for d in row.get("Drug Class", "").split(";") if d.strip()]
             metadata[aro] = {
                 "gene": row.get("ARO Name", "unknown").strip(),
@@ -189,12 +226,11 @@ def call_orfs(
     out_proteins = Path(out_proteins)
     out_proteins.parent.mkdir(parents=True, exist_ok=True)
 
-    # Load all contigs, train gene finder on them
     records = list(SeqIO.parse(str(fasta_path), "fasta"))
     sequences = [str(r.seq) for r in records]
     contig_ids = [r.id for r in records]
 
-    gene_finder = pyrodigal.GeneFinder(meta=True)  # meta mode for metagenomes
+    gene_finder = pyrodigal.GeneFinder(meta=True)
 
     orfs: list[ORF] = []
     with open(out_proteins, "w") as fh:
@@ -217,23 +253,23 @@ def call_orfs(
 
 
 # ---------------------------------------------------------------------------
-# DIAMOND search
+# DIAMOND search (shared by CARD and SARG)
 # ---------------------------------------------------------------------------
 
 
 def run_diamond(
     protein_fasta: Path | str,
-    card_db: Path | str,
+    db: Path | str,
     out_tsv: Path | str,
     threads: int = 8,
-    min_identity: float = MIN_IDENTITY,
-    min_coverage: float = MIN_COVERAGE,
+    min_identity: float = CARD_MIN_IDENTITY,
+    min_coverage: float = CARD_MIN_COVERAGE,
 ) -> Path:
-    """Run DIAMOND BLASTp against the CARD protein database.
+    """Run DIAMOND BLASTp against a protein database.
 
     Args:
         protein_fasta: ORF-called protein sequences (from call_orfs).
-        card_db: Path to DIAMOND-formatted CARD database (.dmnd file).
+        db: Path to DIAMOND-formatted database (.dmnd file).
         out_tsv: Output path for DIAMOND tabular results.
         threads: Number of CPU threads.
         min_identity: Minimum % amino-acid identity to report.
@@ -243,12 +279,11 @@ def run_diamond(
         Path to the TSV output file.
     """
     protein_fasta = Path(protein_fasta)
-    card_db = Path(card_db)
+    db = Path(db)
     out_tsv = Path(out_tsv)
     out_tsv.parent.mkdir(parents=True, exist_ok=True)
 
-    # Strip .dmnd extension if provided — DIAMOND adds it automatically
-    db_stem = str(card_db).removesuffix(".dmnd")
+    db_stem = str(db).removesuffix(".dmnd")
 
     cmd = [
         "diamond",
@@ -275,7 +310,7 @@ def run_diamond(
         str(threads),
         "--sensitive",
         "--max-target-seqs",
-        "1",  # top hit per ORF
+        "1",
     ]
     logger.info("Running DIAMOND: %s", " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -286,20 +321,15 @@ def run_diamond(
 
 
 # ---------------------------------------------------------------------------
-# Parsing
+# CARD hit parser
 # ---------------------------------------------------------------------------
 
 
 def parse_diamond_hits(
     tsv_path: Path | str,
-    card_metadata: dict[str, dict] | None = None,
+    card_metadata: dict[str, dict] | None = None,  # type: ignore[type-arg]
 ) -> list[ARGHit]:
-    """Parse DIAMOND tabular output into ARGHit objects.
-
-    Extracts gene name and ARO accession directly from the CARD FASTA header
-    embedded in sseqid / stitle. If card_metadata is provided, it is used to
-    look up drug class, AMR family, and resistance mechanism; otherwise these
-    fields fall back to "unknown".
+    """Parse DIAMOND tabular output from a CARD search into ARGHit objects.
 
     Args:
         tsv_path: Path to DIAMOND tabular output (format 6 with columns:
@@ -307,7 +337,7 @@ def parse_diamond_hits(
         card_metadata: Optional dict from load_card_metadata().
 
     Returns:
-        List of ARGHit, one per passing hit line.
+        List of ARGHit with source="CARD".
     """
     tsv_path = Path(tsv_path)
     hits: list[ARGHit] = []
@@ -320,30 +350,24 @@ def parse_diamond_hits(
             parts = line.split("\t")
             if len(parts) < 6:
                 continue
-            qseqid, sseqid, pident, qcovhsp, evalue, _ = (
+            qseqid, sseqid, pident, qcovhsp, evalue = (
                 parts[0],
                 parts[1],
                 parts[2],
                 parts[3],
                 parts[4],
-                parts[5],
             )
 
-            # Derive contig ID by stripping Prodigal ORF suffix (_N)
             contig_id = re.sub(r"_\d+$", "", qseqid)
 
-            # Parse CARD fields from sseqid:
-            # format: gb|PROT_ACC|ARO:XXXXX|GENE_NAME
             match = _CARD_SSEQID_RE.search(sseqid)
             if match:
                 aro = match.group("aro")
                 gene_name = match.group("gene")
             else:
-                # Fall back to extracting from stitle
                 aro = "unknown"
                 gene_name = sseqid
 
-            # Look up rich metadata if available
             meta = (card_metadata or {}).get(aro, {})
 
             hits.append(
@@ -357,11 +381,125 @@ def parse_diamond_hits(
                     identity=float(pident),
                     coverage=float(qcovhsp),
                     evalue=float(evalue),
+                    source="CARD",
+                    _orf_id=qseqid,
                 )
             )
 
-    logger.info("Parsed %d ARG hits from %s", len(hits), tsv_path)
+    logger.info("Parsed %d CARD ARG hits from %s", len(hits), tsv_path)
     return hits
+
+
+# ---------------------------------------------------------------------------
+# SARG hit parser
+# ---------------------------------------------------------------------------
+
+
+def parse_sarg_hits(tsv_path: Path | str) -> list[ARGHit]:
+    """Parse DIAMOND tabular output from a SARG search into ARGHit objects.
+
+    SARG FASTA headers use pipe-delimited fields embedded in sseqid / stitle:
+        acc|drug_type|subtype|gene_name
+    e.g.
+        Ec_mcr1_NG050715.1_1|polymyxin|MCR|mcr-1
+        AY123456_1|beta-lactam|NDM|NDM-1
+
+    If the sseqid does not match this format the drug type and subtype fall
+    back to "unknown" while the gene name is taken from the raw sseqid.
+
+    Args:
+        tsv_path: Path to DIAMOND tabular output (format 6):
+                  qseqid sseqid pident qcovhsp evalue stitle.
+
+    Returns:
+        List of ARGHit with source="SARG".
+    """
+    tsv_path = Path(tsv_path)
+    hits: list[ARGHit] = []
+
+    with open(tsv_path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 6:
+                continue
+            qseqid, sseqid, pident, qcovhsp, evalue, stitle = (
+                parts[0],
+                parts[1],
+                parts[2],
+                parts[3],
+                parts[4],
+                parts[5],
+            )
+
+            contig_id = re.sub(r"_\d+$", "", qseqid)
+
+            # Try sseqid first, then fall back to stitle (which contains the full header)
+            match = _SARG_SSEQID_RE.search(sseqid) or _SARG_SSEQID_RE.search(stitle)
+            if match:
+                drug_type = match.group("drug_type").strip()
+                subtype = match.group("subtype").strip()
+                gene_name = match.group("gene").strip()
+            else:
+                drug_type = "unknown"
+                subtype = "unknown"
+                gene_name = sseqid.split("|")[-1] if "|" in sseqid else sseqid
+
+            hits.append(
+                ARGHit(
+                    contig_id=contig_id,
+                    gene_name=gene_name,
+                    aro_accession=sseqid.split("|")[0] if "|" in sseqid else sseqid,
+                    amr_family=subtype,
+                    drug_class=drug_type,
+                    resistance_mechanism="unknown",
+                    identity=float(pident),
+                    coverage=float(qcovhsp),
+                    evalue=float(evalue),
+                    source="SARG",
+                    _orf_id=qseqid,
+                )
+            )
+
+    logger.info("Parsed %d SARG ARG hits from %s", len(hits), tsv_path)
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# Dual-database merge
+# ---------------------------------------------------------------------------
+
+
+def merge_arg_hits(
+    card_hits: list[ARGHit],
+    sarg_hits: list[ARGHit],
+) -> list[ARGHit]:
+    """Merge CARD and SARG hit lists, preferring CARD when both detect the same ORF.
+
+    Deduplication is per-ORF (_orf_id): if an ORF produced a CARD hit it is
+    kept and the corresponding SARG hit for that ORF is discarded.  SARG hits
+    for ORFs *not* found by CARD are appended as supplementary hits.
+
+    Args:
+        card_hits: Hits from parse_diamond_hits() (source="CARD").
+        sarg_hits: Hits from parse_sarg_hits() (source="SARG").
+
+    Returns:
+        Merged list: all CARD hits + SARG-only hits, stable-ordered.
+    """
+    card_orf_ids: set[str] = {h._orf_id for h in card_hits if h._orf_id}
+    sarg_only = [h for h in sarg_hits if h._orf_id not in card_orf_ids]
+
+    merged = card_hits + sarg_only
+    logger.info(
+        "Merged ARG hits: %d CARD + %d SARG-only = %d total",
+        len(card_hits),
+        len(sarg_only),
+        len(merged),
+    )
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -375,26 +513,61 @@ def annotate_contigs(
     aro_index_path: Path | str,
     work_dir: Path | str,
     threads: int = 8,
+    sarg_db: Path | str | None = None,
 ) -> list[ARGHit]:
     """End-to-end ARG annotation: ORF prediction → DIAMOND → parsed hits.
 
+    When *sarg_db* is provided the function runs a second DIAMOND search
+    against the SARG database and supplements CARD hits with any genes found
+    only in SARG (see merge_arg_hits() for the deduplication logic).
+
     Args:
         fasta_path: Nucleotide FASTA of contigs to annotate.
-        card_db: Path to DIAMOND .dmnd database.
-        aro_index_path: Path to aro_index.tsv.
-        work_dir: Directory for intermediate files (proteins.faa, diamond.tsv).
+        card_db: Path to DIAMOND .dmnd database built from CARD proteins.
+        aro_index_path: Path to CARD aro_index.tsv.
+        work_dir: Directory for intermediate files.
         threads: CPU threads for DIAMOND.
+        sarg_db: Optional path to a DIAMOND .dmnd database built from SARG
+                 (download SARG FASTA from https://smile.hku.hk/SARGs then
+                  run: diamond makedb --in sarg.fasta -d sarg).
 
     Returns:
-        List of ARGHit across all contigs.
+        List of ARGHit across all contigs.  Hits from CARD have source="CARD";
+        SARG-only supplements have source="SARG".
     """
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
     proteins_path = work_dir / "proteins.faa"
-    diamond_tsv = work_dir / "diamond_hits.tsv"
+    card_tsv = work_dir / "card_hits.tsv"
 
     call_orfs(fasta_path, proteins_path)
-    run_diamond(proteins_path, card_db, diamond_tsv, threads=threads)
+    run_diamond(
+        proteins_path,
+        card_db,
+        card_tsv,
+        threads=threads,
+        min_identity=CARD_MIN_IDENTITY,
+        min_coverage=CARD_MIN_COVERAGE,
+    )
     metadata = load_card_metadata(aro_index_path)
-    return parse_diamond_hits(diamond_tsv, metadata)
+    card_hits = parse_diamond_hits(card_tsv, metadata)
+
+    if sarg_db is not None:
+        sarg_db_path = Path(sarg_db)
+        if sarg_db_path.exists() or sarg_db_path.with_suffix(".dmnd").exists():
+            sarg_tsv = work_dir / "sarg_hits.tsv"
+            run_diamond(
+                proteins_path,
+                sarg_db_path,
+                sarg_tsv,
+                threads=threads,
+                min_identity=SARG_MIN_IDENTITY,
+                min_coverage=SARG_MIN_COVERAGE,
+            )
+            sarg_hits = parse_sarg_hits(sarg_tsv)
+            return merge_arg_hits(card_hits, sarg_hits)
+        else:
+            logger.warning("SARG database not found at %s — running CARD-only annotation", sarg_db)
+
+    return card_hits
