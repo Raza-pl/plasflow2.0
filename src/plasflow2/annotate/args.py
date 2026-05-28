@@ -51,11 +51,12 @@ SARG_MIN_COVERAGE = 80.0
 # CARD sseqid format:  gb|PROT_ACC|ARO:XXXXX|GENE_NAME [Organism]
 _CARD_SSEQID_RE = re.compile(r"gb\|(?P<prot_acc>[^|]+)\|(?P<aro>ARO:\d+)\|(?P<gene>[^\s\[]+)")
 
-# SARG sseqid format:  acc|Type|Subtype|Gene_name
-# e.g.  Ec_mcr1_NG050715.1_1|polymyxin|MCR|mcr-1
-#       AY123456_1|beta-lactam|NDM|NDM-1
+# SARG sseqid format:  SARG|drug_type|gene_family[*]|WP_accession
+# e.g.  SARG|beta-lactam|bla*|WP_459377734.1
+#       SARG|polymyxin|mcr*|WP_000001234.1
+#       SARG|aminoglycoside|aph(6)*|WP_000005678.1
 _SARG_SSEQID_RE = re.compile(
-    r"(?P<acc>[^|]+)\|(?P<drug_type>[^|]+)\|(?P<subtype>[^|]+)\|(?P<gene>[^|\s]+)"
+    r"SARG\|(?P<drug_type>[^|]+)\|(?P<gene_family>[^|*]+)\*?\|(?P<accession>\S+)"
 )
 
 
@@ -398,14 +399,21 @@ def parse_diamond_hits(
 def parse_sarg_hits(tsv_path: Path | str) -> list[ARGHit]:
     """Parse DIAMOND tabular output from a SARG search into ARGHit objects.
 
-    SARG FASTA headers use pipe-delimited fields embedded in sseqid / stitle:
-        acc|drug_type|subtype|gene_name
+    SARG FASTA headers use pipe-delimited fields:
+        SARG|drug_type|gene_family[*]|WP_accession description
     e.g.
-        Ec_mcr1_NG050715.1_1|polymyxin|MCR|mcr-1
-        AY123456_1|beta-lactam|NDM|NDM-1
+        SARG|beta-lactam|bla*|WP_459377734.1 MULTISPECIES: class A beta-lactamase
+        SARG|polymyxin|mcr*|WP_000001234.1 mobile colistin resistance protein
+        SARG|aminoglycoside|aph(6)*|WP_000005678.1 aminoglycoside phosphotransferase
 
-    If the sseqid does not match this format the drug type and subtype fall
-    back to "unknown" while the gene name is taken from the raw sseqid.
+    Field mapping:
+        gene_family (stripped of trailing *) → gene_name  (e.g. "bla", "mcr", "aph(6)")
+        drug_type                            → drug_class
+        WP_accession                         → aro_accession
+        gene_family                          → amr_family
+
+    If the sseqid does not match this format, drug_class falls back to
+    "unknown" and gene_name is taken from the last pipe-delimited token.
 
     Args:
         tsv_path: Path to DIAMOND tabular output (format 6):
@@ -440,19 +448,24 @@ def parse_sarg_hits(tsv_path: Path | str) -> list[ARGHit]:
             match = _SARG_SSEQID_RE.search(sseqid) or _SARG_SSEQID_RE.search(stitle)
             if match:
                 drug_type = match.group("drug_type").strip()
-                subtype = match.group("subtype").strip()
-                gene_name = match.group("gene").strip()
+                gene_family = match.group("gene_family").strip()
+                accession = match.group("accession").strip()
+                # gene_family is already stripped of trailing * by the regex
+                gene_name = gene_family  # e.g. "bla", "mcr", "aph(6)"
+                amr_family_val = gene_family
+                aro_accession_val = accession  # e.g. "WP_459377734.1"
             else:
                 drug_type = "unknown"
-                subtype = "unknown"
                 gene_name = sseqid.split("|")[-1] if "|" in sseqid else sseqid
+                amr_family_val = "unknown"
+                aro_accession_val = sseqid.split("|")[-1] if "|" in sseqid else sseqid
 
             hits.append(
                 ARGHit(
                     contig_id=contig_id,
                     gene_name=gene_name,
-                    aro_accession=sseqid.split("|")[0] if "|" in sseqid else sseqid,
-                    amr_family=subtype,
+                    aro_accession=aro_accession_val,
+                    amr_family=amr_family_val,
                     drug_class=drug_type,
                     resistance_mechanism="unknown",
                     identity=float(pident),

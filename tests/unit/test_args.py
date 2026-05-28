@@ -65,17 +65,17 @@ def _write_diamond_tsv(path: Path, lines: list[str] | None = None) -> None:
 # Fixtures / helpers — SARG
 # ---------------------------------------------------------------------------
 
-# SARG DIAMOND output: sseqid has pipe-delimited acc|type|subtype|gene
+# SARG DIAMOND output: sseqid uses actual SARG format SARG|drug_type|gene_family*|WP_accession
 _SARG_TSV_LINES = [
-    # mcr-1 — polymyxin resistance, not in CARD synthetic set
-    "contigC_2\tEc_mcr1_NG050715.1_1|polymyxin|MCR|mcr-1\t85.0\t82.0\t2e-60\t"
-    "Ec_mcr1_NG050715.1_1|polymyxin|MCR|mcr-1 mobile colistin resistance\n",
-    # aph(6)-Id — aminoglycoside, SARG-only contig
-    "contigD_1\tAY123456_1|aminoglycoside|APH(6)|aph(6)-Id\t88.5\t90.0\t3e-75\t"
-    "AY123456_1|aminoglycoside|APH(6)|aph(6)-Id aminoglycoside phosphotransferase\n",
+    # mcr — polymyxin resistance, not in CARD synthetic set
+    "contigC_2\tSARG|polymyxin|mcr*|WP_000001234.1\t85.0\t82.0\t2e-60\t"
+    "SARG|polymyxin|mcr*|WP_000001234.1 mobile colistin resistance protein\n",
+    # aph(6) — aminoglycoside, SARG-only contig
+    "contigD_1\tSARG|aminoglycoside|aph(6)*|WP_000005678.1\t88.5\t90.0\t3e-75\t"
+    "SARG|aminoglycoside|aph(6)*|WP_000005678.1 aminoglycoside phosphotransferase\n",
     # Same ORF as CARD contigA_1 — should be deduplicated in favour of CARD
-    "contigA_1\tSARG_NDM|beta-lactam|NDM|NDM-1\t81.0\t80.0\t5e-40\t"
-    "SARG_NDM|beta-lactam|NDM|NDM-1\n",
+    "contigA_1\tSARG|beta-lactam|bla*|WP_459377734.1\t81.0\t80.0\t5e-40\t"
+    "SARG|beta-lactam|bla*|WP_459377734.1 class A beta-lactamase\n",
     # Malformed — skip
     "bad\n",
 ]
@@ -251,23 +251,23 @@ def test_parse_sarg_hits_drug_class_from_header(tmp_path: Path) -> None:
 
 
 def test_parse_sarg_hits_gene_name(tmp_path: Path) -> None:
-    """Gene name should be extracted from the last pipe field."""
+    """Gene name should be the gene_family field (trailing * stripped)."""
     tsv = tmp_path / "sarg.tsv"
     _write_sarg_tsv(tsv)
     hits = parse_sarg_hits(tsv)
     gene_names = {h.gene_name for h in hits}
-    assert "mcr-1" in gene_names
-    assert "aph(6)-Id" in gene_names
+    assert "mcr" in gene_names
+    assert "aph(6)" in gene_names
 
 
-def test_parse_sarg_hits_amr_family_is_subtype(tmp_path: Path) -> None:
-    """amr_family should be the SARG subtype field."""
+def test_parse_sarg_hits_amr_family_is_gene_family(tmp_path: Path) -> None:
+    """amr_family should be the SARG gene_family field (trailing * stripped)."""
     tsv = tmp_path / "sarg.tsv"
     _write_sarg_tsv(tsv)
     hits = parse_sarg_hits(tsv)
     subtypes = {h.amr_family for h in hits}
-    assert "MCR" in subtypes
-    assert "APH(6)" in subtypes
+    assert "mcr" in subtypes
+    assert "aph(6)" in subtypes
 
 
 def test_parse_sarg_hits_contig_strips_orf_suffix(tmp_path: Path) -> None:
