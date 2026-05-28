@@ -164,7 +164,10 @@ def _write_annotations_json(plasmid_results: list, output_path: Path) -> None:
                     "arg_score": cr.risk.arg_score,
                     "replicon_score": cr.risk.replicon_score,
                     "context_score": cr.risk.context_score,
+                    "host_score": cr.risk.host_score,
                     "evidence": cr.risk.evidence,
+                    "eskape_host": cr.risk.eskape_host,
+                    "eskape_genus": cr.risk.eskape_genus,
                 },
             }
         )
@@ -662,7 +665,24 @@ def report_cmd(
             else None
         )
 
-        risk = score_plasmid(cid, mob, hits, context)
+        # Reconstruct TaxResult for ESKAPE detection
+        from plasflow2.annotate.taxonomy import TaxResult as _TaxResult
+
+        tax_data = rec.get("taxonomy")
+        tax_obj: _TaxResult | None = None
+        tax_display = "—"
+        if tax_data and tax_data.get("rank") and tax_data["rank"] != "unclassified":
+            tax_display = f"{tax_data['rank']}: {tax_data['taxon']}"
+            tax_obj = _TaxResult(
+                contig_id=cid,
+                lineage=tax_data.get("lineage", ""),
+                rank=tax_data.get("rank", "unclassified"),
+                taxon=tax_data.get("taxon", ""),
+                num_hits=tax_data.get("num_hits", 0),
+                agreement=tax_data.get("agreement", 0.0),
+            )
+
+        risk = score_plasmid(cid, mob, hits, context, tax_obj)
         risk_scores.append(risk.score)
 
         unique_classes = sorted(
@@ -673,12 +693,6 @@ def report_cmd(
                 if dc.strip() and dc.strip() != "unknown"
             }
         )
-
-        # Taxonomy from annotations.json (added in Day 26)
-        tax_data = rec.get("taxonomy")
-        tax_display = "—"
-        if tax_data and tax_data.get("rank") and tax_data["rank"] != "unclassified":
-            tax_display = f"{tax_data['rank']}: {tax_data['taxon']}"
 
         plasmid_rows.append(
             PlasmidRow(
@@ -692,6 +706,8 @@ def report_cmd(
                 risk_score=risk.score,
                 taxonomy=tax_display,
                 risk_evidence="; ".join(risk.evidence) if risk.evidence else "—",
+                eskape_host=risk.eskape_host,
+                eskape_genus=risk.eskape_genus,
             )
         )
 

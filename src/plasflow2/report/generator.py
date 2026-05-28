@@ -64,6 +64,10 @@ _TEMPLATE = """<!DOCTYPE html>
                    font-size: .75rem; font-weight: 600; margin: 1px 2px; }
     .src-card    { background: #e8f0fe; color: #1a56db; }
     .src-sarg    { background: #fef3c7; color: #b45309; }
+    .eskape-badge { display: inline-block; padding: 2px 8px; border-radius: 10px;
+                    font-size: .75rem; font-weight: 700; white-space: nowrap; }
+    .eskape-core  { background: #fde8e8; color: #c0392b; border: 1px solid #e74c3c; }
+    .eskape-who   { background: #fef3c7; color: #b45309; border: 1px solid #f39c12; }
     .filter-bar  { margin: 12px 0 8px; display: flex; gap: 8px; align-items: center; }
     .filter-btn  { padding: 6px 16px; border: none; border-radius: 20px; cursor: pointer;
                    font-size: 0.85rem; font-weight: 600; transition: opacity .15s; }
@@ -138,6 +142,7 @@ _TEMPLATE = """<!DOCTYPE html>
         <th>ARGs</th>
         <th>Drug Classes</th>
         <th>DB Source</th>
+        <th>Pathogen Host</th>
         <th>Mobility</th>
         <th>Replicon</th>
         <th>Risk Score</th>
@@ -159,6 +164,17 @@ _TEMPLATE = """<!DOCTYPE html>
           {% else %}
             —
           {% endfor %}
+        </td>
+        <td>
+          {% if row.eskape_host %}
+            {% if row.eskape_genus in ("Enterococcus","Staphylococcus","Klebsiella","Acinetobacter","Pseudomonas","Enterobacter","Escherichia","Enterobacteriaceae") %}
+              <span class="eskape-badge eskape-core" title="ESKAPE pathogen host">ESKAPE: {{ row.eskape_genus }}</span>
+            {% else %}
+              <span class="eskape-badge eskape-who" title="WHO priority pathogen host">WHO: {{ row.eskape_genus }}</span>
+            {% endif %}
+          {% else %}
+            —
+          {% endif %}
         </td>
         <td>{{ row.mobility_class }}</td>
         <td>{{ row.replicon_type }}</td>
@@ -255,6 +271,9 @@ class PlasmidRow:
     risk_evidence: str  # semicolon-separated evidence strings
     # Comma-separated set of databases that contributed hits, e.g. "CARD" or "CARD, SARG"
     arg_sources: str = ""
+    # ESKAPE / WHO priority pathogen host annotation
+    eskape_host: bool = False  # True if taxonomy matches a recognised priority pathogen
+    eskape_genus: str = ""     # Matched genus (or family), e.g. "Klebsiella"
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +630,8 @@ def build_report_data(pipeline_result, input_file: str = "") -> dict:
                 taxonomy=tax_display,
                 risk_evidence="; ".join(cr.risk.evidence) if cr.risk.evidence else "—",
                 arg_sources=arg_sources,
+                eskape_host=cr.risk.eskape_host,
+                eskape_genus=cr.risk.eskape_genus,
             )
         )
 

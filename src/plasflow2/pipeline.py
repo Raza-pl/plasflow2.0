@@ -292,7 +292,7 @@ def run_pipeline(
         cid = record.id
         mobility = mobility_by_contig.get(cid)
         hits = args_by_contig.get(cid, [])
-        risk = score_plasmid(cid, mobility, hits, source_context)
+        risk = score_plasmid(cid, mobility, hits, source_context, taxonomy_by_contig.get(cid))
         plasmid_results.append(
             ContigResult(
                 record=record,
