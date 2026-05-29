@@ -36,11 +36,14 @@ logger = logging.getLogger(__name__)
 # DIAMOND hit filters
 # ---------------------------------------------------------------------------
 
-# CARD: strict — well-characterised reference sequences
-CARD_MIN_IDENTITY = 90.0
+# CARD: 80 % identity / 80 % coverage — the accepted standard for environmental
+# metagenomics (RGI "Loose" mode, SARG, ResFinder metagenomic mode all use ~80 %).
+# At 90 % (clinical-isolate standard) we miss the divergent ARG variants that
+# dominate WWTP, soil, and aquatic metagenomes.
+CARD_MIN_IDENTITY = 80.0
 CARD_MIN_COVERAGE = 80.0
 
-# SARG: slightly looser — broader database, captures more divergent homologues
+# SARG uses the same cutoffs — unified with CARD for consistency.
 SARG_MIN_IDENTITY = 80.0
 SARG_MIN_COVERAGE = 80.0
 
@@ -527,6 +530,8 @@ def annotate_contigs(
     work_dir: Path | str,
     threads: int = 8,
     sarg_db: Path | str | None = None,
+    min_identity: float = CARD_MIN_IDENTITY,
+    min_coverage: float = CARD_MIN_COVERAGE,
 ) -> list[ARGHit]:
     """End-to-end ARG annotation: ORF prediction → DIAMOND → parsed hits.
 
@@ -543,6 +548,10 @@ def annotate_contigs(
         sarg_db: Optional path to a DIAMOND .dmnd database built from SARG
                  (download SARG FASTA from https://smile.hku.hk/SARGs then
                   run: diamond makedb --in sarg.fasta -d sarg).
+        min_identity: Minimum amino-acid identity % for DIAMOND hits (default
+            80 %).  Use 90 % for clinical-isolate precision; 80 % is the
+            standard for environmental/metagenomic samples.
+        min_coverage: Minimum query coverage % for DIAMOND hits (default 80 %).
 
     Returns:
         List of ARGHit across all contigs.  Hits from CARD have source="CARD";
@@ -560,8 +569,8 @@ def annotate_contigs(
         card_db,
         card_tsv,
         threads=threads,
-        min_identity=CARD_MIN_IDENTITY,
-        min_coverage=CARD_MIN_COVERAGE,
+        min_identity=min_identity,
+        min_coverage=min_coverage,
     )
     metadata = load_card_metadata(aro_index_path)
     card_hits = parse_diamond_hits(card_tsv, metadata)
@@ -575,8 +584,8 @@ def annotate_contigs(
                 sarg_db_path,
                 sarg_tsv,
                 threads=threads,
-                min_identity=SARG_MIN_IDENTITY,
-                min_coverage=SARG_MIN_COVERAGE,
+                min_identity=min_identity,
+                min_coverage=min_coverage,
             )
             sarg_hits = parse_sarg_hits(sarg_tsv)
             return merge_arg_hits(card_hits, sarg_hits)

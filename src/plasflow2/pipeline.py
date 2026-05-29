@@ -124,6 +124,7 @@ def run_pipeline(
     taxon_map_path: Path | str | None = None,
     skip_taxonomy: bool = False,
     sarg_db: Path | str | None = None,
+    min_identity: float = 80.0,
 ) -> PipelineResult:
     """Run the full PlasFlow v2 pipeline on a FASTA file.
 
@@ -168,6 +169,9 @@ def run_pipeline(
             (Structured ARG) database.  When provided, ARG annotation runs
             against both CARD and SARG; CARD hits are preferred per ORF and
             SARG contributes supplementary hits for genes not in CARD.
+        min_identity: Minimum amino-acid identity % for DIAMOND ARG hits
+            (default 80 %).  80 % is the standard for environmental/metagenomic
+            samples; use 90 % for clinical-isolate precision.
 
     Returns:
         :class:`PipelineResult` with all predictions and per-plasmid
@@ -256,6 +260,7 @@ def run_pipeline(
         work_dir=work_dir / "arg_annotation",
         threads=threads,
         sarg_db=sarg_db,
+        min_identity=min_identity,
     )
     # Group hits by contig_id for fast lookup
     args_by_contig: dict[str, list[ARGHit]] = {}

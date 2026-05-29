@@ -437,6 +437,17 @@ def main(ctx: click.Context, verbose: bool) -> None:
         "take precedence per ORF and SARG supplements with genes not found in CARD."
     ),
 )
+@click.option(
+    "--min-identity",
+    "min_identity",
+    default=80.0,
+    show_default=True,
+    help=(
+        "Minimum amino-acid identity %% for DIAMOND ARG hits. "
+        "80%% (default) is the standard for environmental/metagenomic samples. "
+        "Use 90%% for clinical-isolate-grade precision."
+    ),
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -455,6 +466,7 @@ def run(
     taxon_map: str | None,
     skip_taxonomy: bool,
     sarg_db: str | None,
+    min_identity: float,
 ) -> None:
     """Run the full PlasFlow v2 pipeline: classify → annotate → risk → report.
 
@@ -495,6 +507,7 @@ def run(
         taxon_map_path=taxon_map,
         skip_taxonomy=skip_taxonomy,
         sarg_db=sarg_db,
+        min_identity=min_identity,
     )
 
     # --- Write comprehensive predictions TSV (all contigs, all annotations) ---
