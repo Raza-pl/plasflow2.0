@@ -115,7 +115,8 @@ def run_pipeline(
     aro_index: Path | str,
     work_dir: Path | str,
     source_context: str = "unspecified",
-    confidence_threshold: float = 0.7,
+    confidence_threshold: float = 0.70,
+    plasmid_threshold: float = 0.95,
     min_contig_length: int = 1000,
     threads: int = 8,
     skip_mobility: bool = False,
@@ -145,8 +146,12 @@ def run_pipeline(
         source_context: Sample provenance for risk scoring — one of
             ``clinical``, ``wastewater``, ``environmental``,
             ``unspecified``.
-        confidence_threshold: Minimum MLP confidence to assign a label
-            (sequences below this are labelled ``unclassified``).
+        confidence_threshold: Minimum MLP confidence for chromosome / phage /
+            archaea calls (sequences below this are labelled ``unclassified``).
+        plasmid_threshold: Minimum MLP confidence for plasmid calls.  Defaults
+            to 0.95 — higher than *confidence_threshold* — to compensate for
+            class-prior imbalance: the model trains on ~25 % plasmid but real
+            metagenomes contain only ~2–5 % plasmid.
         min_contig_length: Discard sequences shorter than this (bp).
         threads: CPU threads for DIAMOND and MOB-suite.
         skip_mobility: If True, skip mob_typer and set mobility to None
@@ -216,6 +221,7 @@ def run_pipeline(
         seq_ids,
         model_path,
         threshold=confidence_threshold,
+        plasmid_threshold=plasmid_threshold,
     )
     pred_by_id = {p.sequence_id: p for p in predictions}
 

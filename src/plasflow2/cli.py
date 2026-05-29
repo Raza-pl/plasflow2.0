@@ -376,7 +376,18 @@ def main(ctx: click.Context, verbose: bool) -> None:
     "--threshold",
     default=0.7,
     show_default=True,
-    help="Confidence threshold; sequences below this are 'unclassified'.",
+    help="Confidence threshold for chromosome/phage/archaea; sequences below this are 'unclassified'.",
+)
+@click.option(
+    "--plasmid-threshold",
+    "plasmid_threshold",
+    default=0.95,
+    show_default=True,
+    help=(
+        "Confidence threshold for plasmid calls (default 0.95). "
+        "Higher than --threshold to correct for class-prior imbalance: "
+        "the model trains on ~25% plasmid but real metagenomes have ~2-5% plasmid."
+    ),
 )
 @click.option(
     "--context",
@@ -435,6 +446,7 @@ def run(
     card_db: str | None,
     aro_index: str | None,
     threshold: float,
+    plasmid_threshold: float,
     context: str,
     threads: int,
     min_length: int,
@@ -475,6 +487,7 @@ def run(
         work_dir=out / "work",
         source_context=context,
         confidence_threshold=threshold,
+        plasmid_threshold=plasmid_threshold,
         min_contig_length=min_length,
         threads=threads,
         skip_mobility=skip_mobility,
