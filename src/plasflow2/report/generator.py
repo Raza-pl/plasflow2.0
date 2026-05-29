@@ -67,6 +67,12 @@ _TEMPLATE = """<!DOCTYPE html>
     .eskape-badge { display: inline-block; padding: 2px 8px; border-radius: 10px;
                     font-size: .75rem; font-weight: 700; white-space: nowrap; }
     .eskape-core  { background: #fde8e8; color: #c0392b; border: 1px solid #e74c3c; }
+    .vf-count     { display: inline-block; padding: 1px 7px; border-radius: 10px;
+                    font-size: .75rem; font-weight: 700;
+                    background: #fef3c7; color: #92400e; border: 1px solid #f59e0b; }
+    .mge-count    { display: inline-block; padding: 1px 7px; border-radius: 10px;
+                    font-size: .75rem; font-weight: 700;
+                    background: #ede9fe; color: #5b21b6; border: 1px solid #8b5cf6; }
     .eskape-who   { background: #fef3c7; color: #b45309; border: 1px solid #f39c12; }
     .filter-bar  { margin: 12px 0 8px; display: flex; gap: 8px; align-items: center; }
     .filter-btn  { padding: 6px 16px; border: none; border-radius: 20px; cursor: pointer;
@@ -88,7 +94,9 @@ _TEMPLATE = """<!DOCTYPE html>
     Input: <code>{{ input_file }}</code> &nbsp;|&nbsp;
     Sequences: <strong>{{ total }}</strong> &nbsp;|&nbsp;
     Plasmids: <strong>{{ num_plasmids }}</strong> &nbsp;|&nbsp;
-    ARGs: <strong>{{ total_args }}</strong>
+    ARGs: <strong>{{ total_args }}</strong> &nbsp;|&nbsp;
+    VFs: <strong>{{ total_vf if total_vf is defined else 0 }}</strong> &nbsp;|&nbsp;
+    MGEs: <strong>{{ total_mge if total_mge is defined else 0 }}</strong>
     {% if tax_classified is defined and tax_classified > 0 %}
     &nbsp;|&nbsp; Taxonomy-classified: <strong>{{ tax_classified }}</strong>
     {% endif %}
@@ -142,6 +150,10 @@ _TEMPLATE = """<!DOCTYPE html>
         <th>ARGs</th>
         <th>Drug Classes</th>
         <th>DB Source</th>
+        <th>VFs</th>
+        <th>VF Genes</th>
+        <th>MGEs</th>
+        <th>IS Families</th>
         <th>Pathogen Host</th>
         <th>Mobility</th>
         <th>Replicon</th>
@@ -165,6 +177,10 @@ _TEMPLATE = """<!DOCTYPE html>
             —
           {% endfor %}
         </td>
+        <td>{% if row.num_vf > 0 %}<span class="vf-count">{{ row.num_vf }}</span>{% else %}—{% endif %}</td>
+        <td class="tax-label" title="{{ row.vf_genes }}">{{ row.vf_genes if row.vf_genes else "—" }}</td>
+        <td>{% if row.num_mge > 0 %}<span class="mge-count">{{ row.num_mge }}</span>{% else %}—{% endif %}</td>
+        <td class="tax-label" title="{{ row.mge_families }}">{{ row.mge_families if row.mge_families else "—" }}</td>
         <td>
           {% if row.eskape_host %}
             {% if row.eskape_genus in ("Enterococcus","Staphylococcus","Klebsiella","Acinetobacter","Pseudomonas","Enterobacter","Escherichia","Enterobacteriaceae") %}
@@ -357,6 +373,12 @@ class PlasmidRow:
     # ESKAPE / WHO priority pathogen host annotation
     eskape_host: bool = False  # True if taxonomy matches a recognised priority pathogen
     eskape_genus: str = ""  # Matched genus (or family), e.g. "Klebsiella"
+    # Virulence factors (VFDB)
+    num_vf: int = 0
+    vf_genes: str = ""  # semicolon-separated gene names
+    # Mobile genetic elements (ISfinder)
+    num_mge: int = 0
+    mge_families: str = ""  # semicolon-separated IS families
 
 
 @dataclass
@@ -712,6 +734,14 @@ def build_report_data(pipeline_result, input_file: str = "") -> dict:
         sources = sorted({h.source for h in cr.arg_hits if hasattr(h, "source") and h.source})
         arg_sources = ", ".join(sources) if sources else ""
 
+        # VF hits (VFDB)
+        vf_hits = getattr(cr, "vf_hits", [])
+        vf_genes = "; ".join(sorted({h.gene_name for h in vf_hits})) if vf_hits else ""
+
+        # MGE hits (ISfinder)
+        mge_hits = getattr(cr, "mge_hits", [])
+        mge_families = "; ".join(sorted({h.is_family for h in mge_hits})) if mge_hits else ""
+
         plasmid_rows.append(
             PlasmidRow(
                 contig_id=cr.record.id,
@@ -727,6 +757,10 @@ def build_report_data(pipeline_result, input_file: str = "") -> dict:
                 arg_sources=arg_sources,
                 eskape_host=cr.risk.eskape_host,
                 eskape_genus=cr.risk.eskape_genus,
+                num_vf=len(vf_hits),
+                vf_genes=vf_genes,
+                num_mge=len(mge_hits),
+                mge_families=mge_families,
             )
         )
 
@@ -768,11 +802,16 @@ def build_report_data(pipeline_result, input_file: str = "") -> dict:
         else:
             other_rows.append(row)
 
+    total_vf = sum(row.num_vf for row in plasmid_rows)
+    total_mge = sum(row.num_mge for row in plasmid_rows)
+
     return {
         "input_file": input_file or str(pipeline_result.input_fasta),
         "total": pipeline_result.total_sequences,
         "num_plasmids": pipeline_result.total_plasmids,
         "total_args": pipeline_result.total_args,
+        "total_vf": total_vf,
+        "total_mge": total_mge,
         "tax_classified": tax_classified,
         "class_counts": pipeline_result.class_counts,
         "pie_data": _build_pie_data(pipeline_result.class_counts),
