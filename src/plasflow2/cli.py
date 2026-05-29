@@ -35,7 +35,7 @@ from plasflow2 import __version__
 from plasflow2.annotate.args import annotate_contigs
 from plasflow2.annotate.mobility import annotate_mobility
 from plasflow2.classify.predict import predict
-from plasflow2.pipeline import run_pipeline
+from plasflow2.pipeline import PipelineResult, run_pipeline
 from plasflow2.report.generator import (
     PlasmidRow,
     _build_arg_chart,
@@ -86,24 +86,164 @@ def _resolve_model(model_path: str | None) -> Path:
     )
 
 
-def _write_predictions_tsv(predictions: list, output_path: Path) -> None:
-    """Write per-sequence classification results to TSV."""
+def _write_predictions_tsv(pipeline_result: PipelineResult, output_path: Path) -> None:
+    """Write comprehensive per-contig results to TSV — all classes, all annotations.
+
+    Columns
+    -------
+    All contigs:
+        contig_id, length, label, confidence,
+        plasmid_score, chromosome_score, phage_score, archaea_score,
+        taxonomy, taxonomy_rank, taxonomy_lineage
+
+    Plasmid contigs (empty string for all other classes):
+        num_args, drug_classes, arg_sources,
+        mobility_class, replicon_type, relaxase_type, mpf_type,
+        risk_score, mobility_score, arg_score, replicon_score,
+        context_score, host_score, risk_evidence,
+        eskape_host, eskape_genus
+    """
+    PLASMID_EMPTY = [""] * 16  # filler for non-plasmid rows
+
+    HEADER = [
+        # ── universal ────────────────────────────────────────────────────
+        "contig_id",
+        "length",
+        "label",
+        "confidence",
+        "plasmid_score",
+        "chromosome_score",
+        "phage_score",
+        "archaea_score",
+        "taxonomy",
+        "taxonomy_rank",
+        "taxonomy_lineage",
+        # ── plasmid-specific ─────────────────────────────────────────────
+        "num_args",
+        "drug_classes",
+        "arg_sources",
+        "mobility_class",
+        "replicon_type",
+        "relaxase_type",
+        "mpf_type",
+        "risk_score",
+        "mobility_score",
+        "arg_score",
+        "replicon_score",
+        "context_score",
+        "host_score",
+        "risk_evidence",
+        "eskape_host",
+        "eskape_genus",
+    ]
+
+    def _tax_fields(tax) -> list:
+        if tax is None:
+            return ["", "", ""]
+        return [tax.display, tax.rank, tax.lineage]
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Index plasmid results by contig_id for O(1) lookup
+    plasmid_by_id = {cr.record.id: cr for cr in pipeline_result.plasmid_results}
+    # Index all records by contig_id for length lookup
+    record_by_id = {cr.record.id: cr.record for cr in pipeline_result.plasmid_results}
+    record_by_id.update({cr.record.id: cr.record for cr in pipeline_result.non_plasmid_results})
+
+    with open(output_path, "w", newline="") as fh:
+        writer = csv.writer(fh, delimiter="\t")
+        writer.writerow(HEADER)
+
+        for pred in pipeline_result.all_predictions:
+            cid = pred.sequence_id
+            rec = record_by_id.get(cid)
+            length = len(rec.seq) if rec else 0
+
+            scores = pred.scores if hasattr(pred, "scores") and pred.scores else {}
+            base_cols = [
+                cid,
+                length,
+                pred.label,
+                f"{pred.confidence:.4f}",
+                f"{scores.get('plasmid', 0):.4f}",
+                f"{scores.get('chromosome', 0):.4f}",
+                f"{scores.get('phage', 0):.4f}",
+                f"{scores.get('archaea', 0):.4f}",
+            ]
+
+            # ── Plasmid: full annotation columns ─────────────────────────
+            if pred.label == "plasmid" and cid in plasmid_by_id:
+                cr = plasmid_by_id[cid]
+                tax_cols = _tax_fields(cr.taxonomy)
+
+                unique_classes = sorted(
+                    {
+                        dc.strip()
+                        for h in cr.arg_hits
+                        for dc in h.drug_class.split(";")
+                        if dc.strip() and dc.strip() != "unknown"
+                    }
+                )
+                sources = sorted(
+                    {h.source for h in cr.arg_hits if hasattr(h, "source") and h.source}
+                )
+                mob = cr.mobility
+                risk = cr.risk
+
+                plasmid_cols = [
+                    len(cr.arg_hits),
+                    "; ".join(unique_classes) if unique_classes else "",
+                    ", ".join(sources) if sources else "",
+                    mob.mobility_class if mob else "",
+                    mob.replicon_type if mob else "",
+                    mob.relaxase_type if mob else "",
+                    mob.mpf_type if mob else "",
+                    risk.score,
+                    risk.mobility_score,
+                    risk.arg_score,
+                    risk.replicon_score,
+                    risk.context_score,
+                    risk.host_score,
+                    "; ".join(risk.evidence) if risk.evidence else "",
+                    risk.eskape_host,
+                    risk.eskape_genus,
+                ]
+            else:
+                # Non-plasmid: taxonomy from non_plasmid_results
+                tax = pipeline_result.taxonomy.get(cid)
+                tax_cols = _tax_fields(tax)
+                plasmid_cols = PLASMID_EMPTY
+
+            writer.writerow(base_cols + tax_cols + plasmid_cols)
+
+
+def _write_predictions_tsv_simple(predictions: list, output_path: Path) -> None:
+    """Lightweight TSV writer used by 'plasflow2 classify' (no pipeline result)."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", newline="") as fh:
         writer = csv.writer(fh, delimiter="\t")
         writer.writerow(
-            ["sequence_id", "label", "confidence", "plasmid", "chromosome", "phage", "archaea"]
+            [
+                "contig_id",
+                "label",
+                "confidence",
+                "plasmid_score",
+                "chromosome_score",
+                "phage_score",
+                "archaea_score",
+            ]
         )
         for p in predictions:
+            scores = p.scores if hasattr(p, "scores") and p.scores else {}
             writer.writerow(
                 [
                     p.sequence_id,
                     p.label,
                     f"{p.confidence:.4f}",
-                    f"{p.scores.get('plasmid', 0):.4f}",
-                    f"{p.scores.get('chromosome', 0):.4f}",
-                    f"{p.scores.get('phage', 0):.4f}",
-                    f"{p.scores.get('archaea', 0):.4f}",
+                    f"{scores.get('plasmid', 0):.4f}",
+                    f"{scores.get('chromosome', 0):.4f}",
+                    f"{scores.get('phage', 0):.4f}",
+                    f"{scores.get('archaea', 0):.4f}",
                 ]
             )
 
@@ -344,9 +484,9 @@ def run(
         sarg_db=sarg_db,
     )
 
-    # --- Write predictions TSV (all contigs) ---
+    # --- Write comprehensive predictions TSV (all contigs, all annotations) ---
     preds_tsv = out / "predictions.tsv"
-    _write_predictions_tsv(pipeline_result.all_predictions, preds_tsv)
+    _write_predictions_tsv(pipeline_result, preds_tsv)
     click.echo(f"  Predictions → {preds_tsv}")
 
     # --- Write per-class FASTAs (from all loaded records) ---
@@ -420,7 +560,7 @@ def classify(
     )
 
     out_path = Path(output_tsv)
-    _write_predictions_tsv(predictions, out_path)
+    _write_predictions_tsv_simple(predictions, out_path)
 
     counts: dict[str, int] = {}
     for p in predictions:
@@ -571,18 +711,11 @@ def annotate(
 
 @main.command("report")
 @click.option(
-    "--annotations",
-    "-a",
-    required=True,
-    type=click.Path(exists=True),
-    help="annotations.json produced by 'run' or 'annotate'.",
-)
-@click.option(
     "--predictions",
     "-p",
     required=True,
     type=click.Path(exists=True),
-    help="predictions.tsv produced by 'run' or 'classify'.",
+    help="predictions.tsv produced by 'plasflow2 run' (comprehensive format with all annotations).",
 )
 @click.option(
     "--output",
@@ -591,6 +724,14 @@ def annotate(
     required=True,
     type=click.Path(),
     help="Output HTML file path.",
+)
+@click.option(
+    "--annotations",
+    "-a",
+    default=None,
+    type=click.Path(exists=False),
+    hidden=True,
+    help="[Deprecated] annotations.json — ignored; all data now comes from predictions.tsv.",
 )
 @click.option(
     "--context",
@@ -602,125 +743,165 @@ def annotate(
 @click.pass_context
 def report_cmd(
     ctx: click.Context,
-    annotations: str,
     predictions: str,
     output_html: str,
+    annotations: str | None,
     context: str,
 ) -> None:
-    """Build an interactive HTML report from annotations + predictions TSV.
+    """Regenerate an HTML report from predictions.tsv (no pipeline re-run needed).
 
-    Use this when you want to regenerate the report without re-running
-    the full pipeline.
+    The predictions.tsv produced by 'plasflow2 run' contains all annotations
+    (ARGs, mobility, risk scores, taxonomy, ESKAPE host) for every contig.
+    This command reads that file and rebuilds the full interactive report.
     """
-    with open(annotations) as fh:
-        ann_records = json.load(fh)
+    from plasflow2.annotate.args import ARGHit
+    from plasflow2.annotate.mobility import MobilityResult
+    from plasflow2.annotate.taxonomy import TaxResult as _TaxResult
+    from plasflow2.report.generator import NonPlasmidRow
 
-    # Read predictions TSV
+    if annotations:
+        click.echo(
+            "Note: --annotations is deprecated. All data is now read from predictions.tsv.",
+            err=True,
+        )
+
+    plasmid_rows: list[PlasmidRow] = []
+    non_plasmid_rows: list[NonPlasmidRow] = []
+    all_arg_hits_for_chart: list[ARGHit] = []
+    risk_scores: list[int] = []
     class_counts: dict[str, int] = {}
     total = 0
+
     with open(predictions) as fh:
         reader = csv.DictReader(fh, delimiter="\t")
         for row in reader:
             total += 1
             label = row.get("label", "unclassified")
             class_counts[label] = class_counts.get(label, 0) + 1
+            cid = row["contig_id"]
+            length = int(row.get("length", 0) or 0)
+            confidence = float(row.get("confidence", 0) or 0)
 
-    # Build a minimal report_data dict from flat JSON
-    from plasflow2.annotate.args import ARGHit
-    from plasflow2.annotate.mobility import MobilityResult
+            # Taxonomy
+            tax_display = row.get("taxonomy", "") or "—"
+            tax_rank = row.get("taxonomy_rank", "") or ""
+            tax_lineage = row.get("taxonomy_lineage", "") or ""
+            tax_obj: _TaxResult | None = None
+            if tax_rank and tax_rank not in ("", "unclassified"):
+                tax_obj = _TaxResult(
+                    contig_id=cid,
+                    lineage=tax_lineage,
+                    rank=tax_rank,
+                    taxon=row.get("taxonomy", ""),
+                    num_hits=int(row.get("taxonomy_num_hits", 0) or 0),
+                    agreement=float(row.get("taxonomy_agreement", 0) or 0),
+                )
 
-    plasmid_rows = []
-    all_arg_hits = []
-    risk_scores = []
+            if label == "plasmid":
+                # Reconstruct ARGHit objects for the drug-class chart
+                # (stored compactly in TSV; we rebuild from aggregate columns)
+                drug_classes_str = row.get("drug_classes", "") or ""
+                arg_sources_str = row.get("arg_sources", "") or ""
+                num_args = int(row.get("num_args", 0) or 0)
+                # Create one synthetic ARGHit per drug class for charting purposes
+                for dc in drug_classes_str.split(";"):
+                    dc = dc.strip()
+                    if dc:
+                        all_arg_hits_for_chart.append(
+                            ARGHit(
+                                contig_id=cid,
+                                gene_name="",
+                                aro_accession="",
+                                amr_family="",
+                                drug_class=dc,
+                                resistance_mechanism="",
+                                identity=100.0,
+                                coverage=100.0,
+                                evalue=0.0,
+                                source=arg_sources_str.split(",")[0].strip() or "CARD",
+                            )
+                        )
 
-    for rec in ann_records:
-        cid = rec["contig_id"]
-        hits = [
-            ARGHit(
-                contig_id=cid,
-                gene_name=h["gene_name"],
-                aro_accession=h.get("aro_accession", "unknown"),
-                amr_family=h.get("amr_family", "unknown"),
-                drug_class=h["drug_class"],
-                resistance_mechanism=h.get("resistance_mechanism", "unknown"),
-                identity=h["identity"],
-                coverage=h["coverage"],
-                evalue=h["evalue"],
-                source=h.get("source", "CARD"),
-            )
-            for h in rec.get("arg_hits", [])
-        ]
-        all_arg_hits.extend(hits)
+                mob_class = row.get("mobility_class", "") or "unknown"
+                rep_type = row.get("replicon_type", "") or "unknown"
+                risk_score = int(row.get("risk_score", 0) or 0)
+                risk_scores.append(risk_score)
 
-        mob_data = rec.get("mobility")
-        mob = (
-            MobilityResult(
-                contig_id=cid,
-                mobility_class=mob_data["mobility_class"],
-                replicon_type=mob_data["replicon_type"],
-                relaxase_type=mob_data["relaxase_type"],
-                mpf_type=mob_data["mpf_type"],
-            )
-            if mob_data
-            else None
-        )
+                mob = (
+                    MobilityResult(
+                        contig_id=cid,
+                        mobility_class=mob_class,
+                        replicon_type=rep_type,
+                        relaxase_type=row.get("relaxase_type", "") or "none",
+                        mpf_type=row.get("mpf_type", "") or "none",
+                    )
+                    if mob_class
+                    else None
+                )
 
-        # Reconstruct TaxResult for ESKAPE detection
-        from plasflow2.annotate.taxonomy import TaxResult as _TaxResult
+                risk = score_plasmid(cid, mob, [], context, tax_obj)
+                # Override computed risk with stored values from TSV (pipeline already scored)
+                risk.score = risk_score
+                risk.mobility_score = int(row.get("mobility_score", 0) or 0)
+                risk.arg_score = int(row.get("arg_score", 0) or 0)
+                risk.replicon_score = int(row.get("replicon_score", 0) or 0)
+                risk.context_score = int(row.get("context_score", 0) or 0)
+                risk.host_score = int(row.get("host_score", 0) or 0)
+                risk.eskape_host = row.get("eskape_host", "False").lower() == "true"
+                risk.eskape_genus = row.get("eskape_genus", "") or ""
+                risk.evidence = [
+                    e.strip() for e in row.get("risk_evidence", "").split(";") if e.strip()
+                ]
 
-        tax_data = rec.get("taxonomy")
-        tax_obj: _TaxResult | None = None
-        tax_display = "—"
-        if tax_data and tax_data.get("rank") and tax_data["rank"] != "unclassified":
-            tax_display = f"{tax_data['rank']}: {tax_data['taxon']}"
-            tax_obj = _TaxResult(
-                contig_id=cid,
-                lineage=tax_data.get("lineage", ""),
-                rank=tax_data.get("rank", "unclassified"),
-                taxon=tax_data.get("taxon", ""),
-                num_hits=tax_data.get("num_hits", 0),
-                agreement=tax_data.get("agreement", 0.0),
-            )
+                plasmid_rows.append(
+                    PlasmidRow(
+                        contig_id=cid,
+                        contig_length=length,
+                        confidence=confidence,
+                        num_args=num_args,
+                        drug_classes=drug_classes_str if drug_classes_str else "—",
+                        mobility_class=mob_class,
+                        replicon_type=rep_type,
+                        risk_score=risk_score,
+                        taxonomy=tax_display,
+                        risk_evidence=row.get("risk_evidence", "") or "—",
+                        arg_sources=arg_sources_str,
+                        eskape_host=risk.eskape_host,
+                        eskape_genus=risk.eskape_genus,
+                    )
+                )
+            else:
+                non_plasmid_rows.append(
+                    NonPlasmidRow(
+                        contig_id=cid,
+                        contig_length=length,
+                        label=label,
+                        confidence=confidence,
+                        taxonomy=tax_display,
+                        taxonomy_lineage=tax_lineage,
+                    )
+                )
 
-        risk = score_plasmid(cid, mob, hits, context, tax_obj)
-        risk_scores.append(risk.score)
-
-        unique_classes = sorted(
-            {
-                dc.strip()
-                for h in hits
-                for dc in h.drug_class.split(";")
-                if dc.strip() and dc.strip() != "unknown"
-            }
-        )
-
-        plasmid_rows.append(
-            PlasmidRow(
-                contig_id=cid,
-                contig_length=rec.get("length", 0),
-                confidence=rec.get("classification", {}).get("confidence", 0.0),
-                num_args=len(hits),
-                drug_classes="; ".join(unique_classes) if unique_classes else "—",
-                mobility_class=mob.mobility_class if mob else "unknown",
-                replicon_type=mob.replicon_type if mob else "unknown",
-                risk_score=risk.score,
-                taxonomy=tax_display,
-                risk_evidence="; ".join(risk.evidence) if risk.evidence else "—",
-                eskape_host=risk.eskape_host,
-                eskape_genus=risk.eskape_genus,
-            )
-        )
+    phage_rows = [r for r in non_plasmid_rows if r.label == "phage"]
+    chromosome_rows = [r for r in non_plasmid_rows if r.label == "chromosome"]
+    other_rows = [r for r in non_plasmid_rows if r.label not in ("phage", "chromosome")]
 
     report_data = {
-        "input_file": annotations,
+        "input_file": predictions,
         "total": total,
-        "num_plasmids": len(ann_records),
-        "total_args": len(all_arg_hits),
+        "num_plasmids": len(plasmid_rows),
+        "total_args": sum(1 for h in all_arg_hits_for_chart),
         "class_counts": class_counts,
         "pie_data": _build_pie_data(class_counts),
-        "arg_data": _build_arg_chart(all_arg_hits),
+        "arg_data": _build_arg_chart(all_arg_hits_for_chart),
         "risk_data": _build_risk_histogram(risk_scores),
         "plasmid_rows": plasmid_rows,
+        "phage_rows": phage_rows,
+        "chromosome_rows": chromosome_rows,
+        "other_rows": other_rows,
+        "has_phages": len(phage_rows) > 0,
+        "has_chromosomes": len(chromosome_rows) > 0,
+        "has_others": len(other_rows) > 0,
     }
 
     out_path = generate_report(report_data, output_html)

@@ -238,7 +238,7 @@ def test_classify_writes_tsv(tmp_path: Path) -> None:
     assert out_tsv.exists()
     rows = list(csv.DictReader(out_tsv.open(), delimiter="\t"))
     assert len(rows) == 2
-    assert rows[0]["sequence_id"] == "p1"
+    assert rows[0]["contig_id"] == "p1"
     assert rows[0]["label"] == "plasmid"
 
 
@@ -273,13 +273,13 @@ def test_classify_tsv_has_correct_columns(tmp_path: Path) -> None:
     with open(out_tsv) as fh:
         header = fh.readline().strip().split("\t")
     assert header == [
-        "sequence_id",
+        "contig_id",
         "label",
         "confidence",
-        "plasmid",
-        "chromosome",
-        "phage",
-        "archaea",
+        "plasmid_score",
+        "chromosome_score",
+        "phage_score",
+        "archaea_score",
     ]
 
 
@@ -389,12 +389,17 @@ def test_report_cmd_produces_html(tmp_path: Path) -> None:
         )
     )
 
-    # Write minimal predictions.tsv
+    # Write minimal predictions.tsv (new 27-column format)
     preds = tmp_path / "predictions.tsv"
     preds.write_text(
-        "sequence_id\tlabel\tconfidence\tplasmid\tchromosome\tphage\tarchaea\n"
-        "p1\tplasmid\t0.95\t0.95\t0.02\t0.02\t0.01\n"
-        "c1\tchromosome\t0.90\t0.05\t0.90\t0.03\t0.02\n"
+        "contig_id\tlength\tlabel\tconfidence\tplasmid_score\tchromosome_score\tphage_score\tarchaea_score\t"
+        "taxonomy\ttaxonomy_rank\ttaxonomy_lineage\t"
+        "num_args\tdrug_classes\targ_sources\t"
+        "mobility_class\treplicon_type\trelaxase_type\tmpf_type\t"
+        "risk_score\tmobility_score\targ_score\treplicon_score\t"
+        "context_score\thost_score\trisk_evidence\teskape_host\teskape_genus\n"
+        "p1\t5000\tplasmid\t0.95\t0.95\t0.02\t0.02\t0.01\t\t\t\t0\t\t\t\t\t\t\t0\t0\t0\t0\t0\t0\t\tFalse\t\n"
+        "c1\t3000\tchromosome\t0.90\t0.05\t0.90\t0.03\t0.02\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\n"
     )
 
     out_html = tmp_path / "report.html"

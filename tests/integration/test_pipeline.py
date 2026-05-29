@@ -351,7 +351,7 @@ def test_cli_run_writes_all_output_files(tmp_path: Path) -> None:
     assert tsv.exists()
     rows = list(csv.DictReader(tsv.open(), delimiter="\t"))
     assert len(rows) == 2
-    labels = {r["sequence_id"]: r["label"] for r in rows}
+    labels = {r["contig_id"]: r["label"] for r in rows}
     assert labels["p1"] == "plasmid"
     assert labels["c1"] == "chromosome"
 
@@ -426,13 +426,33 @@ def test_cli_run_predictions_tsv_columns(tmp_path: Path) -> None:
     with open(out / "predictions.tsv") as fh:
         header = fh.readline().strip().split("\t")
     assert header == [
-        "sequence_id",
+        "contig_id",
+        "length",
         "label",
         "confidence",
-        "plasmid",
-        "chromosome",
-        "phage",
-        "archaea",
+        "plasmid_score",
+        "chromosome_score",
+        "phage_score",
+        "archaea_score",
+        "taxonomy",
+        "taxonomy_rank",
+        "taxonomy_lineage",
+        "num_args",
+        "drug_classes",
+        "arg_sources",
+        "mobility_class",
+        "replicon_type",
+        "relaxase_type",
+        "mpf_type",
+        "risk_score",
+        "mobility_score",
+        "arg_score",
+        "replicon_score",
+        "context_score",
+        "host_score",
+        "risk_evidence",
+        "eskape_host",
+        "eskape_genus",
     ]
 
 
@@ -564,7 +584,7 @@ def test_cli_classify_writes_tsv_with_correct_rows(tmp_path: Path) -> None:
 
     rows = list(csv.DictReader(out_tsv.open(), delimiter="\t"))
     assert len(rows) == 3
-    labels = {r["sequence_id"]: r["label"] for r in rows}
+    labels = {r["contig_id"]: r["label"] for r in rows}
     assert labels == {"p1": "plasmid", "c1": "chromosome", "ph1": "phage"}
 
 
@@ -593,9 +613,9 @@ def test_cli_classify_confidence_values_in_tsv(tmp_path: Path) -> None:
     row = rows[0]
     assert float(row["confidence"]) == pytest.approx(0.9876, abs=1e-3)
     # plasmid score should be the dominant value
-    assert float(row["plasmid"]) == pytest.approx(0.9876, abs=1e-3)
+    assert float(row["plasmid_score"]) == pytest.approx(0.9876, abs=1e-3)
     # other scores should be ~0
-    assert float(row["chromosome"]) == pytest.approx(0.0, abs=1e-3)
+    assert float(row["chromosome_score"]) == pytest.approx(0.0, abs=1e-3)
 
 
 # ---------------------------------------------------------------------------
@@ -729,10 +749,15 @@ def _write_test_files(tmp_path: Path) -> tuple[Path, Path]:
 
     preds = tmp_path / "predictions.tsv"
     preds.write_text(
-        "sequence_id\tlabel\tconfidence\tplasmid\tchromosome\tphage\tarchaea\n"
-        "p1\tplasmid\t0.97\t0.97\t0.01\t0.01\t0.01\n"
-        "p2\tplasmid\t0.94\t0.94\t0.02\t0.02\t0.02\n"
-        "c1\tchromosome\t0.91\t0.05\t0.91\t0.02\t0.02\n"
+        "contig_id\tlength\tlabel\tconfidence\tplasmid_score\tchromosome_score\tphage_score\tarchaea_score\t"
+        "taxonomy\ttaxonomy_rank\ttaxonomy_lineage\t"
+        "num_args\tdrug_classes\targ_sources\t"
+        "mobility_class\treplicon_type\trelaxase_type\tmpf_type\t"
+        "risk_score\tmobility_score\targ_score\treplicon_score\t"
+        "context_score\thost_score\trisk_evidence\teskape_host\teskape_genus\n"
+        "p1\t5000\tplasmid\t0.97\t0.97\t0.01\t0.01\t0.01\t\t\t\t0\t\t\t\t\t\t\t0\t0\t0\t0\t0\t0\t\tFalse\t\n"
+        "p2\t4000\tplasmid\t0.94\t0.94\t0.02\t0.02\t0.02\t\t\t\t0\t\t\t\t\t\t\t0\t0\t0\t0\t0\t0\t\tFalse\t\n"
+        "c1\t3000\tchromosome\t0.91\t0.05\t0.91\t0.02\t0.02\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\n"
     )
     return ann, preds
 
@@ -818,8 +843,13 @@ def test_cli_report_empty_annotations(tmp_path: Path) -> None:
     ann.write_text("[]")
     preds = tmp_path / "predictions.tsv"
     preds.write_text(
-        "sequence_id\tlabel\tconfidence\tplasmid\tchromosome\tphage\tarchaea\n"
-        "c1\tchromosome\t0.95\t0.02\t0.95\t0.02\t0.01\n"
+        "contig_id\tlength\tlabel\tconfidence\tplasmid_score\tchromosome_score\tphage_score\tarchaea_score\t"
+        "taxonomy\ttaxonomy_rank\ttaxonomy_lineage\t"
+        "num_args\tdrug_classes\targ_sources\t"
+        "mobility_class\treplicon_type\trelaxase_type\tmpf_type\t"
+        "risk_score\tmobility_score\targ_score\treplicon_score\t"
+        "context_score\thost_score\trisk_evidence\teskape_host\teskape_genus\n"
+        "c1\t3000\tchromosome\t0.95\t0.02\t0.95\t0.02\t0.01\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\n"
     )
     out_html = tmp_path / "report.html"
 

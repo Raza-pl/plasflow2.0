@@ -61,12 +61,28 @@ class ContigResult:
 
 
 @dataclass
+class NonPlasmidContigResult:
+    """Prediction + taxonomy for a chromosome / phage / archaea / unclassified contig.
+
+    Does not carry ARG, mobility, or risk annotations (plasmid-only steps).
+    The taxonomy field is populated when --skip-taxonomy is False and a
+    DIAMOND taxonomy database is available — same LCA pipeline as plasmids.
+    """
+
+    record: SeqRecord
+    prediction: Prediction
+    taxonomy: TaxResult | None = None
+
+
+@dataclass
 class PipelineResult:
     """Aggregated results for one run_pipeline() call."""
 
     input_fasta: Path
     all_predictions: list[Prediction]  # every contig, all classes
     plasmid_results: list[ContigResult]  # plasmid contigs only, fully annotated
+    # Non-plasmid contigs: chromosome, phage, archaea, unclassified — prediction + taxonomy only
+    non_plasmid_results: list[NonPlasmidContigResult] = field(default_factory=list)
     # Taxonomy results for ALL contigs (keyed by contig_id); empty if skipped
     taxonomy: dict[str, TaxResult] = field(default_factory=dict)
     # Convenience counts
@@ -304,10 +320,26 @@ def run_pipeline(
             )
         )
 
+    # ------------------------------------------------------------------
+    # 8. Build NonPlasmidContigResult list (chromosome / phage / archaea / unclassified)
+    # ------------------------------------------------------------------
+    non_plasmid_results: list[NonPlasmidContigResult] = []
+    for record in records:
+        cid = record.id
+        if pred_by_id[cid].label != "plasmid":
+            non_plasmid_results.append(
+                NonPlasmidContigResult(
+                    record=record,
+                    prediction=pred_by_id[cid],
+                    taxonomy=taxonomy_by_contig.get(cid),
+                )
+            )
+
     result = PipelineResult(
         input_fasta=fasta_path,
         all_predictions=predictions,
         plasmid_results=plasmid_results,
+        non_plasmid_results=non_plasmid_results,
         taxonomy=taxonomy_by_contig,
     )
     tax_classified = sum(1 for r in taxonomy_by_contig.values() if r.rank != "unclassified")

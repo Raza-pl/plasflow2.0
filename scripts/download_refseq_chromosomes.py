@@ -7,27 +7,42 @@ represented in the training set (e.g. Klebsiella pneumoniae).
 
 This script uses NCBI taxonomy IDs to bulk-search each major bacterial phylum
 for complete RefSeq assemblies, then downloads one genome per species for
-maximum diversity.  Default target: 1,000 genomes across 14 phyla.
+maximum diversity.  Default target: 10,000 genomes across 14 phyla.
 
-Phylum distribution (default --count 1000):
-    Pseudomonadota (Proteobacteria)   300  — largest, most clinical relevance
-    Bacillota (Firmicutes)            200
-    Actinomycetota (Actinobacteria)   150
-    Bacteroidota                      100
-    Campylobacterota                   50
-    Cyanobacteriota                    50
-    Spirochaetota                      30
-    Deinococcota                       20
-    Chloroflexota                      20
-    Chlamydiota                        20
-    Mycoplasmatota                     20
-    Fusobacteriota                     20
-    Thermotogota                       10
-    Aquificota + other                 10
+Phylum distribution (default --count 10000):
+    Pseudomonadota (Proteobacteria)  3000  — largest, most clinical relevance
+    Bacillota (Firmicutes)           2000
+    Actinomycetota (Actinobacteria)  1500
+    Bacteroidota                     1000
+    Campylobacterota                  500
+    Cyanobacteriota                   500
+    Spirochaetota                     300
+    Deinococcota                      200
+    Chloroflexota                     200
+    Chlamydiota                       200
+    Mycoplasmatota                    200
+    Fusobacteriota                    200
+    Thermotogota                      100
+    Aquificota + other                100
+
+Disk space estimate:
+    ~4 MB per genome (uncompressed FASTA) × 10,000 = ~40 GB
+    Download bandwidth (gzipped): ~1.5 MB × 10,000 = ~15 GB transferred
+    Allow at least 50 GB free space before running.
+
+NCBI rate limits:
+    Without API key: 3 requests/second → ~3 hours for 10,000 genomes
+    With API key:   10 requests/second → ~1 hour for 10,000 genomes
+    Register for a free NCBI API key at:
+    https://www.ncbi.nlm.nih.gov/account/
 
 Usage:
-    # Download 1,000 diverse genomes (~15–20 GB total)
+    # Download 10,000 diverse genomes (~40 GB total, ~3 hours without API key)
     python scripts/download_refseq_chromosomes.py --outdir data/chromosomes/
+
+    # Faster with NCBI API key
+    python scripts/download_refseq_chromosomes.py \\
+        --outdir data/chromosomes/ --api-key YOUR_KEY_HERE
 
     # Smaller run for quick testing
     python scripts/download_refseq_chromosomes.py --count 200 --outdir data/chromosomes/
@@ -37,16 +52,16 @@ Usage:
 
     # Single phylum only
     python scripts/download_refseq_chromosomes.py \\
-        --phylum Pseudomonadota --count 100 --outdir data/chromosomes/
+        --phylum Pseudomonadota --count 3000 --outdir data/chromosomes/
 
 After downloading, retrain the MLP:
     python scripts/build_dataset.py \\
-        --plasmid-dir  data/plasmids/ \\
-        --chrom-dir    data/chromosomes/ \\
-        --phage-dir    data/phages/ \\
-        --output       data/features.npy \\
-        --labels       data/labels.npy \\
-        --n-per-class  7500
+        --plasmid-dir   data/databases/plasmidscope/ \\
+        --chrom-dir     data/chromosomes/ \\
+        --metagenome-dir data/metagenomes/ \\
+        --data-dir      data/databases/ \\
+        --max-per-class 75000 \\
+        --out           data/
 
     python scripts/train_model.py \\
         --mlp --data data/features.npy --labels data/labels.npy \\
@@ -68,6 +83,7 @@ from Bio import Entrez  # type: ignore[import]
 
 Entrez.email = "plasflow2@example.com"
 Entrez.tool = "plasflow2"
+# Entrez.api_key is set at runtime from --api-key if provided
 
 
 # ---------------------------------------------------------------------------
@@ -323,10 +339,11 @@ def main() -> None:
     parser.add_argument(
         "--count",
         type=int,
-        default=1000,
+        default=10000,
         help=(
             "Total number of genomes to download across all phyla "
-            "(default: 1000). Distributed proportionally per phylum."
+            "(default: 10000). Distributed proportionally per phylum. "
+            "~40 GB disk space required for 10,000 genomes."
         ),
     )
     parser.add_argument(
@@ -341,6 +358,15 @@ def main() -> None:
         "--email",
         default="plasflow2@example.com",
         help="Email address for NCBI Entrez (required by NCBI policy).",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help=(
+            "NCBI API key for higher rate limits (10 req/s vs 3 req/s). "
+            "Register free at https://www.ncbi.nlm.nih.gov/account/ — "
+            "strongly recommended for --count >= 5000."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -361,6 +387,19 @@ def main() -> None:
     args = parser.parse_args()
 
     Entrez.email = args.email
+    if args.api_key:
+        Entrez.api_key = args.api_key
+        # With an API key NCBI allows 10 req/s; use a tighter delay
+        if args.delay >= 0.4:
+            args.delay = 0.12
+        print(f"NCBI API key set — using {args.delay:.2f}s delay between requests.")
+    elif args.count >= 5000:
+        print(
+            "WARNING: Downloading {:,} genomes without an NCBI API key may take 3+ hours "
+            "and risks rate-limit errors.\n"
+            "         Pass --api-key YOUR_KEY for 3× faster downloads.\n"
+            "         Register free at https://www.ncbi.nlm.nih.gov/account/".format(args.count)
+        )
     args.outdir.mkdir(parents=True, exist_ok=True)
 
     # Select phyla
@@ -440,14 +479,20 @@ def main() -> None:
         total_mb = sum(p.stat().st_size for p in new_files if p.exists()) / 1_000_000
         print(f"\nTotal disk usage: {total_mb:.0f} MB in {args.outdir}")
         print("\nNext steps — retrain the MLP:")
-        print("  python scripts/build_dataset.py \\")
-        print("    --plasmid-dir data/plasmids/ \\")
-        print(f"    --chrom-dir   {args.outdir} \\")
-        print("    --phage-dir   data/phages/ \\")
-        print("    --output      data/features.npy \\")
-        print("    --labels      data/labels.npy \\")
-        print("    --n-per-class 7500")
+        print("  # (Optional) Download 3 metagenome assemblies (>300K contigs each):")
+        print("  python scripts/download_metagenome_assemblies.py \\")
+        print("    --outdir data/metagenomes/")
         print("")
+        print("  # Build training dataset:")
+        print("  python scripts/build_dataset.py \\")
+        print("    --plasmid-dir    data/databases/plasmidscope/ \\")
+        print(f"    --chrom-dir      {args.outdir} \\")
+        print("    --metagenome-dir data/metagenomes/ \\")
+        print("    --data-dir       data/databases/ \\")
+        print("    --max-per-class  75000 \\")
+        print("    --out            data/")
+        print("")
+        print("  # Train MLP:")
         print("  python scripts/train_model.py \\")
         print("    --mlp --data data/features.npy --labels data/labels.npy \\")
         print("    --epochs 50 --output data/models/mlp_v2.pt")
