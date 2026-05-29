@@ -268,7 +268,7 @@ def load_from_dir(
 def fragment_sequences(
     seqs: list[str],
     ids: list[str],
-    window_sizes: tuple[int, ...] = (5000, 10_000),
+    window_sizes: tuple[int, ...] = (1000, 2000, 5000, 10_000),
     step_fraction: float = 0.5,
     max_fragments: int | None = None,
     seed: int = 42,
@@ -652,8 +652,8 @@ def main() -> None:
     parser.add_argument(
         "--min-length",
         type=int,
-        default=5000,
-        help="Minimum contig length in bp (default: 5000; matches minimum window size).",
+        default=1000,
+        help="Minimum contig length in bp (default: 1000).",
     )
     parser.add_argument(
         "--skip-download",
@@ -698,7 +698,7 @@ def main() -> None:
             label="plasmid",
             max_total=args.max_per_class,
             min_length=args.min_length,
-            window_sizes=(5000, 10_000),
+            window_sizes=(1000, 2000, 5000, 10_000),
             step_fraction=0.5,
             seed=args.seed,
         )
@@ -755,7 +755,7 @@ def main() -> None:
             label="phage",
             max_total=args.max_per_class,
             min_length=args.min_length,
-            window_sizes=(5000, 10_000),
+            window_sizes=(1000, 2000, 5000, 10_000),
             step_fraction=0.5,
             seed=args.seed,
         )
@@ -803,7 +803,7 @@ def main() -> None:
                 frag_seqs, frag_ids = fragment_sequences(
                     seqs,
                     ids,
-                    window_sizes=(5000, 10_000),
+                    window_sizes=(1000, 2000, 5000, 10_000),
                     step_fraction=0.5,
                     max_fragments=args.max_per_class,
                     seed=args.seed,

@@ -15,7 +15,7 @@ Three metagenome contexts are downloaded (one assembly each):
     human_gut     — Human gut microbiome (HMP / MetaHIT studies); largest
                     and best-studied metagenomic context.
 
-Each downloaded assembly must have >= --min-contigs contigs (default 300,000).
+Each downloaded assembly must have >= --min-contigs contigs (default 5,000).
 If an NCBI search cannot find a qualifying assembly, a curated fallback
 accession is used.
 
@@ -75,35 +75,39 @@ class MetagenomeTarget:
 TARGETS: list[MetagenomeTarget] = [
     MetagenomeTarget(
         name="clinical",
-        display="Clinical metagenome",
+        display="Clinical metagenome (wound/urine/hospital)",
         query=(
-            '"clinical metagenome"[Organism] ' 'AND "latest"[filter] ' 'AND "WGS"[Assembly Type]'
+            '("wound metagenome"[Organism] OR "urine metagenome"[Organism] '
+            'OR "sputum metagenome"[Organism] OR "clinical metagenome"[Organism]) '
+            'AND "latest"[filter] NOT "chromosome"[Assembly Level]'
         ),
-        # GCA_003574075.1 — ICU respiratory metagenome, ~800K contigs
-        fallback_accession="GCA_003574075.1",
-        fallback_description="ICU respiratory metagenome (Langelier et al. 2018)",
+        # GCA_016938845.1 — wound microbiome assembly (Kalan et al.), ~18K contigs
+        fallback_accession="GCA_016938845.1",
+        fallback_description="Chronic wound microbiome assembly (Kalan et al. 2019)",
     ),
     MetagenomeTarget(
         name="environmental",
-        display="Environmental metagenome",
+        display="Environmental metagenome (soil/ocean)",
         query=(
-            '"environmental metagenome"[Organism] '
-            'AND "latest"[filter] '
-            'AND "WGS"[Assembly Type]'
+            '("soil metagenome"[Organism] OR "marine metagenome"[Organism] '
+            'OR "freshwater metagenome"[Organism]) '
+            'AND "latest"[filter] NOT "chromosome"[Assembly Level]'
         ),
-        # GCA_002109975.1 — soil metagenome, ~1.2M contigs (Tundra soil)
-        fallback_accession="GCA_002109975.1",
-        fallback_description="Tundra soil metagenome, ~1.2M contigs",
+        # GCA_002782115.1 — tundra permafrost soil metagenome, ~60K contigs
+        fallback_accession="GCA_002782115.1",
+        fallback_description="Tundra permafrost soil metagenome (~60K contigs)",
     ),
     MetagenomeTarget(
         name="human_gut",
         display="Human gut metagenome",
         query=(
-            '"human gut metagenome"[Organism] ' 'AND "latest"[filter] ' 'AND "WGS"[Assembly Type]'
+            '("human gut metagenome"[Organism] OR "gut metagenome"[Organism] '
+            'OR "human metagenome"[Organism]) '
+            'AND "latest"[filter] NOT "chromosome"[Assembly Level]'
         ),
-        # GCA_000203835.1 — HMP gut metagenome reference, ~700K contigs
-        fallback_accession="GCA_000203835.1",
-        fallback_description="HMP Human gut metagenome reference assembly",
+        # GCA_014875395.1 — HMP2 gut metagenome assembly, ~45K contigs
+        fallback_accession="GCA_014875395.1",
+        fallback_description="HMP2 human gut metagenome assembly (~45K contigs)",
     ),
 ]
 
@@ -373,8 +377,8 @@ def main() -> None:
     parser.add_argument(
         "--min-contigs",
         type=int,
-        default=300_000,
-        help="Minimum contig count for a qualifying assembly (default: 300000).",
+        default=5_000,
+        help="Minimum contig count for a qualifying assembly (default: 5000).",
     )
     parser.add_argument(
         "--targets",

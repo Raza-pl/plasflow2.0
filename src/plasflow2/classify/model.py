@@ -16,7 +16,7 @@ from plasflow2.utils.device import NUM_CLASSES
 
 logger = logging.getLogger(__name__)
 
-INPUT_DIM = 1280  # 256 (4-mer) + 1024 (5-mer) — update to 2080 when RC k-mers added
+INPUT_DIM = 1281  # 256 (4-mer) + 1024 (5-mer) + 1 (log10 length)
 
 
 class PlasFlowMLP(nn.Module):
@@ -60,6 +60,10 @@ def save_model(model: PlasFlowMLP, path: Path | str) -> None:
 def load_model(path: Path | str, device: torch.device | None = None) -> PlasFlowMLP:
     """Load MLP weights from a .pt file.
 
+    The input dimension is inferred from the checkpoint's first-layer weight
+    shape, so the function remains correct even if FEATURE_DIM changes between
+    releases.
+
     Args:
         path: Path to .pt file.
         device: Target device (defaults to CPU if not specified).
@@ -67,11 +71,14 @@ def load_model(path: Path | str, device: torch.device | None = None) -> PlasFlow
     Returns:
         PlasFlowMLP in eval mode.
     """
-    model = PlasFlowMLP()
     state = torch.load(str(path), map_location="cpu")
+    # Infer input_dim from the saved first-layer weight rather than hardcoding
+    # INPUT_DIM — this survives feature-dimension changes without manual updates.
+    input_dim = state["net.0.weight"].shape[1]
+    model = PlasFlowMLP(input_dim=input_dim)
     model.load_state_dict(state)
     model.eval()
     if device is not None:
         model = model.to(device)
-    logger.info("Loaded MLP from %s", path)
+    logger.info("Loaded MLP from %s  (input_dim=%d)", path, input_dim)
     return model

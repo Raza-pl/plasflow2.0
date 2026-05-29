@@ -1,10 +1,11 @@
 """Unit tests for k-mer feature extraction.
 
-Day 9 target: all tests pass.
+FEATURE_DIM = 1281: 256 (4-mer) + 1024 (5-mer) + 1 (log10 length).
 """
 
 import numpy as np
 from plasflow2.classify.features import (
+    _KMER_DIM,
     FEATURE_DIM,
     extract_features,
     kmer_vector,
@@ -69,3 +70,25 @@ def test_reverse_complement_correctness() -> None:
     assert _reverse_complement("AAAA") == "TTTT"
     assert _reverse_complement("GCGC") == "GCGC"  # palindrome
     assert _reverse_complement("ATCG") == "CGAT"
+
+
+def test_feature_dim_is_1281() -> None:
+    """FEATURE_DIM must equal _KMER_DIM + 1 (length feature)."""
+    assert FEATURE_DIM == _KMER_DIM + 1
+    assert FEATURE_DIM == 1281
+
+
+def test_length_feature_increases_with_sequence_length() -> None:
+    """Longer sequences should have a larger length feature (last column)."""
+    short = "ACGT" * 250  # 1000 bp
+    long = "ACGT" * 2500  # 10000 bp
+    X = extract_features([short, long])
+    assert X[1, -1] > X[0, -1], "Length feature should be larger for the longer sequence"
+
+
+def test_length_feature_in_zero_one_range() -> None:
+    """Length feature (last column) must be in [0, 1] for typical contig lengths."""
+    seqs = ["ACGT" * 250, "ACGT" * 2500, "ACGT" * 25000]  # 1 kb, 10 kb, 100 kb
+    X = extract_features(seqs)
+    assert np.all(X[:, -1] >= 0.0)
+    assert np.all(X[:, -1] <= 1.0)

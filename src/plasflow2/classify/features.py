@@ -60,7 +60,8 @@ _KMER_TO_IDX: dict[int, dict[str, int]] = {
     k: {km: i for i, km in enumerate(vocab)} for k, vocab in _VOCAB.items()
 }
 
-FEATURE_DIM = sum(len(_VOCAB[k]) for k in KMER_SIZES)  # 256 + 1024 = 1280
+_KMER_DIM = sum(len(_VOCAB[k]) for k in KMER_SIZES)  # 256 + 1024 = 1280
+FEATURE_DIM = _KMER_DIM + 1  # +1 for log10(length) feature
 
 # ---------------------------------------------------------------------------
 # Vectorised internals
@@ -151,10 +152,17 @@ def kmer_vector(seq: str, k: int) -> NDArray[np.float32]:
 
 
 def extract_features(sequences: list[str]) -> NDArray[np.float32]:
-    """Extract concatenated k-mer feature matrix for a list of sequences.
+    """Extract concatenated k-mer + length feature matrix for a list of sequences.
 
-    Iterates over KMER_SIZES and fills the matrix column-block by column-block.
-    Progress is logged every 10,000 sequences so long runs stay visible.
+    Feature layout (FEATURE_DIM = 1281 columns):
+      cols 0–255   : normalised 4-mer frequencies (strand-invariant)
+      cols 256–1279: normalised 5-mer frequencies (strand-invariant)
+      col  1280    : log10(sequence length), scaled to [0, 1] over [1 kb, 1 Mb]
+
+    The length feature lets the MLP learn that a 1 kb fragment carries less
+    classification signal than a 10 kb fragment, which dramatically reduces
+    the mis-classification of short metagenomic contigs (the root cause of
+    the train/inference distribution mismatch when training on 5 k/10 k only).
 
     Args:
         sequences: List of DNA strings.
@@ -172,6 +180,14 @@ def extract_features(sequences: list[str]) -> NDArray[np.float32]:
             if (i + 1) % 10_000 == 0:
                 logger.info("  k=%d: %d / %d sequences processed", k, i + 1, n)
         offset += dim
+
+    # Length feature: log10(len) scaled to [0, 1] where 0 = 1 kb, 1 = 1 Mb
+    # Clipped so sequences outside [1 kb, 1 Mb] don't produce out-of-range values.
+    log_min, log_max = np.log10(1_000), np.log10(1_000_000)
+    for i, seq in enumerate(sequences):
+        log_len = np.log10(max(1, len(seq)))
+        X[i, offset] = float(np.clip((log_len - log_min) / (log_max - log_min), 0.0, 1.0))
+
     logger.info("Extracted features: shape %s", X.shape)
     return X
 
