@@ -285,22 +285,45 @@ plasflow2 run \
 
 ## AMR risk score
 
-Each plasmid contig receives a 0–10 risk score combining mobility, ARG burden, replicon breadth, and sample context:
+Each plasmid contig receives a 0–10 risk score across five independent factors, capped at 10.
 
-| Factor | Score |
+### Scoring factors
+
+| Factor | Points |
 |---|---|
-| Conjugative mobility | +3 |
-| Mobilizable | +2 |
-| ≥5 ARGs or ≥3 drug classes | +3 |
-| 3–4 ARGs or 2 drug classes | +2 |
+| **Host taxonomy — ESKAPE/ESKAPEE** (*K. pneumoniae*, *A. baumannii*, *P. aeruginosa*, *S. aureus*, *E. faecium*, *Enterobacter*, *E. coli*) | **+3** |
+| **Host taxonomy — WHO 2024 priority** (*Salmonella*, *Mycobacterium*, *Neisseria*, *Campylobacter*, *H. pylori*, *Shigella*, *S. pneumoniae*, …) | **+2** |
+| Conjugative mobility (MOB-suite) | +3 |
+| Mobilisable mobility (MOB-suite) | +2 |
+| ≥5 ARGs **or** ≥3 drug classes | +3 |
+| 3–4 ARGs **or** 2 drug classes | +2 |
 | 1–2 ARGs | +1 |
 | Broad-host-range replicon (IncP / IncQ / IncW) | +2 |
 | Known narrow-host-range replicon | +1 |
-| Clinical or wastewater source (`--context`) | +2 |
-| Environmental source | +1 |
-| **Maximum (capped)** | **10** |
+| Source context: `clinical` | +3 |
+| Source context: `wastewater` or `food` | +2 |
+| Source context: `environmental` | +1 |
+| **Maximum (capped at)** | **10** |
 
-Risk ≥ 7 = high (red in report), 4–6 = medium (orange), 0–3 = low (green).
+### Why host taxonomy is the top factor
+
+The same conjugative plasmid with a single beta-lactamase is an acute clinical emergency in *Klebsiella pneumoniae* but a distant ecological signal in a soil *Bacillus*. Taxonomy is already computed from DIAMOND + GTDB LCA for every contig at no extra runtime cost, so using it as the highest-weight lever is both biologically correct and free.
+
+ESKAPE/ESKAPEE genus matches score +3; if taxonomy only resolves to family level, *Enterobacteriaceae* is treated as ESKAPE-tier (+3) because that family contains *Klebsiella*, *Escherichia*, and *Enterobacter* — the main clinical threats.
+
+### Source context clarification
+
+| Context | Meaning | Points |
+|---|---|---|
+| `clinical` | Direct patient sample (blood, urine, wound, sputum) — plasmid is already inside a human host | +3 |
+| `wastewater` | Active mixing zone between clinical and environmental strains; well-documented ARG dissemination route | +2 |
+| `food` | Animal / food-production environment; direct human exposure pathway | +2 |
+| `environmental` | Soil, freshwater, marine — distal reservoir. Not zero risk (environmental → clinical transfer is documented) but the transmission chain is longer | +1 |
+| `unspecified` | Unknown origin — no adjustment applied | +0 |
+
+### Risk tiers
+
+Risk ≥ 7 = **high** (red), 4–6 = **medium** (orange), 0–3 = **low** (green).
 
 ---
 
@@ -381,10 +404,79 @@ tests/
 
 ## Roadmap
 
+### Completed ✓
+- [x] 4-class MLP classifier (plasmid · chromosome · phage · archaea)
+- [x] 27-column `predictions.tsv` with per-class scores
+- [x] Interactive HTML report with DataTables for all four contig classes
 - [x] Taxonomy annotation per contig (DIAMOND + GTDB LCA, Kaiju-style)
-- [x] Drug-class co-occurrence heatmap across plasmid contigs (in report)
+- [x] ARG annotation via CARD + SARG (dual-database)
+- [x] Mobility typing via MOB-suite
+- [x] AMR risk scoring (0–10)
+- [x] Drug-class co-occurrence heatmap in report
 - [x] Docker image for zero-setup deployment
-- [ ] Expanded chromosomal training data (1,000 species across 14 phyla — `scripts/download_refseq_chromosomes.py --count 1000`)
+
+### In Progress / Planned
+
+#### Easy Installation — Bioconda package
+Single-command install that pulls in Python, DIAMOND, MOB-suite, and all other
+dependencies automatically:
+```bash
+conda install -c bioconda plasflow2
+```
+No manual PATH configuration or conda juggling required.
+
+#### Long-Read Support
+Native support for Nanopore (MinION) and PacBio (HiFi / CLR) assemblies:
+- Training dataset augmented with long-read assembled plasmid and chromosome sequences
+- `--long-read` flag adjusts length-based feature scaling and confidence thresholds
+- Handles circular-sequence indicators from Flye / Miniasm GFA output
+
+#### Read Assembly Mode
+Accept raw reads, assemble, then classify — no intermediate steps:
+```bash
+# Short reads (Illumina) — assembled with SPAdes
+plasflow2 assemble-classify --reads1 R1.fastq.gz --reads2 R2.fastq.gz \
+    --db-dir /path/to/db/ --out results/
+
+# Long reads (Nanopore)
+plasflow2 assemble-classify --reads reads.fastq.gz --long-read \
+    --db-dir /path/to/db/ --out results/
+
+# Long reads (PacBio HiFi)
+plasflow2 assemble-classify --reads hifi.fastq.gz --long-read --pacbio \
+    --db-dir /path/to/db/ --out results/
+```
+
+Assembly engines: SPAdes (short reads) · Flye (long reads, metagenome mode).
+
+#### Virulence Factor Gene (VFG) Annotation
+Query every plasmid contig against **VFDB** (Virulence Factor Database) using
+DIAMOND BLASTx. Report:
+- VFG name and VF category (adherence, invasion, toxin, immune evasion, …)
+- Drug/virulence combo plasmids flagged as high-priority
+- VFG count and gene list in `predictions.tsv` and the HTML report
+
+#### Mobile Genetic Element (MGE) Annotation
+Three complementary approaches:
+- **Insertion sequences** — ISfinder database; reports IS family and transposase identity
+- **Integrons** — integron_finder; reports integron class (1/2/3) and cassette count
+- **Transposons / composite elements** — Pfam transposase domain search
+
+MGE count and types added to `predictions.tsv` and risk scoring.
+MOB-suite remains the core mobility-typing engine.
+
+#### Circular Plasmid Figures
+For every high-risk plasmid (risk ≥ 7), generate a publication-quality circular
+genome map (SVG + PNG) showing:
+- ARGs — coloured by drug class
+- VFGs — coloured by VF category
+- MGEs — IS elements, integrons, transposons
+- Mobility genes — relaxase, T4SS components, oriT
+
+Figures are embedded in the HTML report and saved as standalone files.
+
+#### Other
+- [ ] Expanded chromosomal training data (1,000 species across 14 phyla)
 - [ ] Snakemake / Nextflow workflow wrapper for batch processing
 - [ ] PyPI release
 

@@ -268,7 +268,7 @@ def load_from_dir(
 def fragment_sequences(
     seqs: list[str],
     ids: list[str],
-    window_sizes: tuple[int, ...] = (1000, 2000, 5000, 10000),
+    window_sizes: tuple[int, ...] = (5000, 10_000),
     step_fraction: float = 0.5,
     max_fragments: int | None = None,
     seed: int = 42,
@@ -437,6 +437,93 @@ def load_metagenome_dir(
     return seqs, ids, labels
 
 
+# ── Streaming windowed loader (memory-efficient) ──────────────────────────────
+
+
+def load_windowed_streaming(
+    files: list[Path],
+    label: str,
+    max_total: int,
+    min_length: int = 1000,
+    window_sizes: tuple[int, ...] = (1000, 2000, 5000, 10_000),
+    step_fraction: float = 0.5,
+    seed: int = 42,
+) -> tuple[list[str], list[str], list[int]]:
+    """Stream FASTA files, window each sequence immediately, reservoir-sample to max_total.
+
+    Memory footprint: max_total × max_window_size  (e.g. 75 K × 10 kb = 750 MB)
+    instead of total_database_size (e.g. 12.8 GB for PLSDB + RefSeq plasmids).
+
+    The full source sequence is held in memory only while its windows are being
+    generated — it is then garbage-collected before the next record is read.
+
+    Algorithm: Vitter's Algorithm R reservoir sampling.  Each window seen so far
+    has equal probability of being in the final reservoir, so the sample is
+    uniformly random even though the total window count is not known in advance.
+
+    Args:
+        files: FASTA files to stream (merged into one pool in order).
+        label: Class label — must be a key in CLASS_TO_IDX.
+        max_total: Reservoir size = maximum windows returned.
+        min_length: Source sequences shorter than this are skipped entirely.
+        window_sizes: Tile each source sequence at these lengths.
+        step_fraction: Step = window × step_fraction  (0.5 = 50 % overlap).
+        seed: RNG seed for reservoir sampling.
+
+    Returns:
+        (sequences, seq_ids, labels) as parallel lists, length ≤ max_total.
+    """
+    rng = random.Random(seed)
+    reservoir: list[tuple[str, str]] = []  # (seq_id, fragment)
+    n_seen = 0  # total windows considered so far (for reservoir probability)
+
+    for fpath in files:
+        logger.info("  Streaming %s …", fpath.name)
+        n_file = 0
+        for rec in _open_fasta(fpath):
+            seq = str(rec.seq).upper()
+            if len(seq) < min_length:
+                continue
+            # Generate and immediately reservoir-sample windows for this record.
+            # The full `seq` string is referenced only inside this inner loop;
+            # once the loop exits the GC can reclaim it.
+            for w in window_sizes:
+                if w > len(seq):
+                    continue
+                step = max(1, int(w * step_fraction))
+                for start in range(0, len(seq) - w + 1, step):
+                    fragment = seq[start : start + w]
+                    n_seen += 1
+                    n_file += 1
+                    if len(reservoir) < max_total:
+                        reservoir.append((f"{rec.id}_w{w}_s{start}", fragment))
+                    else:
+                        # Replace a random existing element with probability
+                        # max_total / n_seen — preserves uniform sampling.
+                        j = rng.randint(0, n_seen - 1)
+                        if j < max_total:
+                            reservoir[j] = (f"{rec.id}_w{w}_s{start}", fragment)
+        logger.info(
+            "    %s: %d source windows generated  (reservoir now %d)",
+            fpath.name,
+            n_file,
+            len(reservoir),
+        )
+
+    label_idx = CLASS_TO_IDX[label]
+    ids = [r[0] for r in reservoir]
+    seqs = [r[1] for r in reservoir]
+    labels_list = [label_idx] * len(seqs)
+    logger.info(
+        "  → '%s' total: %d windows (from %d total windows seen, cap=%d)",
+        label,
+        len(seqs),
+        n_seen,
+        max_total,
+    )
+    return seqs, ids, labels_list
+
+
 # ── Legacy chromosome download ────────────────────────────────────────────────
 
 
@@ -565,8 +652,8 @@ def main() -> None:
     parser.add_argument(
         "--min-length",
         type=int,
-        default=1000,
-        help="Minimum contig length in bp (default: 1000).",
+        default=5000,
+        help="Minimum contig length in bp (default: 5000; matches minimum window size).",
     )
     parser.add_argument(
         "--skip-download",
@@ -595,12 +682,28 @@ def main() -> None:
     logger.info("PLASMID CLASS")
     logger.info("=" * 60)
 
+    # Plasmids: stream-window to avoid OOM.
+    # PLSDB + RefSeq together are ~12 GB of FASTA; loading all sequences as
+    # Python strings before windowing exhausts RAM.  load_windowed_streaming()
+    # windows each sequence immediately and holds only the reservoir (≤ 750 MB).
     if args.plasmid_dir and args.plasmid_dir.is_dir():
-        seqs, ids, labels = load_from_dir(
-            args.plasmid_dir, "plasmid", args.max_per_class, args.min_length, args.seed
+        plasmid_files = _fasta_files_in_dir(args.plasmid_dir, recursive=True)
+        logger.info(
+            "Streaming 'plasmid' from directory: %s  (%d files)",
+            args.plasmid_dir,
+            len(plasmid_files),
+        )
+        seqs, ids, labels = load_windowed_streaming(
+            plasmid_files,
+            label="plasmid",
+            max_total=args.max_per_class,
+            min_length=args.min_length,
+            window_sizes=(5000, 10_000),
+            step_fraction=0.5,
+            seed=args.seed,
         )
     else:
-        # Legacy single-file fallback
+        # Legacy single-file fallback (also streamed)
         plsdb_candidates = [
             data_dir / "plsdb.fna",
             data_dir / "sequences.fasta",
@@ -610,9 +713,13 @@ def main() -> None:
         ]
         plsdb_path = next((p for p in plsdb_candidates if p.exists()), None)
         if plsdb_path is not None:
-            logger.info("Using legacy PLSDB file: %s", plsdb_path)
-            seqs, ids, labels = load_and_subsample(
-                plsdb_path, "plasmid", args.max_per_class, args.min_length, args.seed
+            logger.info("Streaming legacy PLSDB file: %s", plsdb_path)
+            seqs, ids, labels = load_windowed_streaming(
+                [plsdb_path],
+                label="plasmid",
+                max_total=args.max_per_class,
+                min_length=args.min_length,
+                seed=args.seed,
             )
         else:
             logger.warning(
@@ -631,6 +738,9 @@ def main() -> None:
     logger.info("PHAGE CLASS")
     logger.info("=" * 60)
 
+    # Phages: stream-window for the same reason as plasmids.
+    # INPHARED genomes are 20–200 kb each; loading 33K of them saturates RAM.
+    # Windowing also aligns training fragments with inference-time contig sizes.
     inphared_candidates = [
         data_dir / "inphared.fa.gz",
         data_dir / "14Apr2025_genomes.fa.gz",
@@ -639,9 +749,15 @@ def main() -> None:
     ]
     inphared_path = next((p for p in inphared_candidates if p.exists()), None)
     if inphared_path is not None:
-        logger.info("Using INPHARED file: %s", inphared_path)
-        seqs, ids, labels = load_and_subsample(
-            inphared_path, "phage", args.max_per_class, args.min_length, args.seed
+        logger.info("Streaming INPHARED file: %s", inphared_path)
+        seqs, ids, labels = load_windowed_streaming(
+            [inphared_path],
+            label="phage",
+            max_total=args.max_per_class,
+            min_length=args.min_length,
+            window_sizes=(5000, 10_000),
+            step_fraction=0.5,
+            seed=args.seed,
         )
         all_seqs.extend(seqs)
         all_ids.extend(ids)
@@ -687,7 +803,7 @@ def main() -> None:
                 frag_seqs, frag_ids = fragment_sequences(
                     seqs,
                     ids,
-                    window_sizes=(1000, 2000, 5000, 10_000),
+                    window_sizes=(5000, 10_000),
                     step_fraction=0.5,
                     max_fragments=args.max_per_class,
                     seed=args.seed,
