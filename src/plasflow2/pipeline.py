@@ -29,6 +29,7 @@ from pathlib import Path
 from Bio.SeqRecord import SeqRecord  # type: ignore[import]
 
 from plasflow2.annotate.args import ARGHit, annotate_contigs
+from plasflow2.annotate.mge import MGEHit, annotate_mge
 from plasflow2.annotate.mobility import (
     MobilityResult,
     index_by_contig,
@@ -36,6 +37,7 @@ from plasflow2.annotate.mobility import (
     run_mob_typer,
 )
 from plasflow2.annotate.taxonomy import TaxResult, assign_taxonomy
+from plasflow2.annotate.vfdb import VFHit, annotate_vf
 from plasflow2.classify.predict import Prediction, predict
 from plasflow2.risk.scorer import RiskScore, score_plasmid
 from plasflow2.utils.fasta import load_fasta, write_fasta
@@ -58,6 +60,8 @@ class ContigResult:
     mobility: MobilityResult | None
     risk: RiskScore
     taxonomy: TaxResult | None = None  # LCA taxonomy from DIAMOND (optional)
+    vf_hits: list[VFHit] = field(default_factory=list)  # VFDB virulence factors
+    mge_hits: list[MGEHit] = field(default_factory=list)  # ISfinder MGE elements
 
 
 @dataclass
@@ -125,6 +129,8 @@ def run_pipeline(
     skip_taxonomy: bool = False,
     sarg_db: Path | str | None = None,
     min_identity: float = 80.0,
+    vfdb: Path | str | None = None,
+    mge_db: Path | str | None = None,
 ) -> PipelineResult:
     """Run the full PlasFlow v2 pipeline on a FASTA file.
 
@@ -172,6 +178,13 @@ def run_pipeline(
         min_identity: Minimum amino-acid identity % for DIAMOND ARG hits
             (default 80 %).  80 % is the standard for environmental/metagenomic
             samples; use 90 % for clinical-isolate precision.
+        vfdb: Optional path to a DIAMOND .dmnd database built from VFDB set A
+            protein sequences.  When provided, virulence factor annotation runs
+            on plasmid contigs using the pre-predicted ORFs (no extra Prodigal
+            pass needed).
+        mge_db: Optional path to a DIAMOND .dmnd database built from ISfinder
+            transposase protein sequences.  When provided, MGE/IS element
+            annotation runs on plasmid contigs.
 
     Returns:
         :class:`PipelineResult` with all predictions and per-plasmid
@@ -267,6 +280,66 @@ def run_pipeline(
     for hit in arg_hits:
         args_by_contig.setdefault(hit.contig_id, []).append(hit)
 
+    # Pre-predicted proteins path — reused by VFDB and MGE to avoid running
+    # pyrodigal three times on the same sequences.
+    arg_proteins = work_dir / "arg_annotation" / "proteins.faa"
+
+    # ------------------------------------------------------------------
+    # 4b. Virulence factor annotation (VFDB set A)
+    # ------------------------------------------------------------------
+    vf_by_contig: dict[str, list[VFHit]] = {}
+    if vfdb is not None:
+        vfdb_path = Path(vfdb)
+        if vfdb_path.exists() or vfdb_path.with_suffix(".dmnd").exists():
+            logger.info(
+                "Annotating virulence factors on %d plasmid contigs (VFDB) …", len(plasmid_records)
+            )
+            try:
+                vf_hits = annotate_vf(
+                    fasta_path=plasmid_fasta,
+                    vfdb=vfdb_path,
+                    work_dir=work_dir / "vfdb_annotation",
+                    threads=threads,
+                    reuse_proteins=arg_proteins if arg_proteins.exists() else None,
+                )
+                for hit in vf_hits:
+                    vf_by_contig.setdefault(hit.contig_id, []).append(hit)
+                logger.info(
+                    "Found %d virulence factor hits across %d contigs",
+                    len(vf_hits),
+                    len(vf_by_contig),
+                )
+            except Exception as exc:
+                logger.warning("VFDB annotation failed: %s — skipping.", exc)
+        else:
+            logger.warning("VFDB database not found at %s — skipping VF annotation.", vfdb)
+
+    # ------------------------------------------------------------------
+    # 4c. MGE / IS element annotation (ISfinder)
+    # ------------------------------------------------------------------
+    mge_by_contig: dict[str, list[MGEHit]] = {}
+    if mge_db is not None:
+        mge_db_path = Path(mge_db)
+        if mge_db_path.exists() or mge_db_path.with_suffix(".dmnd").exists():
+            logger.info("Annotating MGEs on %d plasmid contigs (ISfinder) …", len(plasmid_records))
+            try:
+                mge_hits = annotate_mge(
+                    fasta_path=plasmid_fasta,
+                    mge_db=mge_db_path,
+                    work_dir=work_dir / "mge_annotation",
+                    threads=threads,
+                    reuse_proteins=arg_proteins if arg_proteins.exists() else None,
+                )
+                for hit in mge_hits:
+                    mge_by_contig.setdefault(hit.contig_id, []).append(hit)
+                logger.info(
+                    "Found %d MGE hits across %d contigs", len(mge_hits), len(mge_by_contig)
+                )
+            except Exception as exc:
+                logger.warning("MGE annotation failed: %s — skipping.", exc)
+        else:
+            logger.warning("MGE database not found at %s — skipping MGE annotation.", mge_db)
+
     # ------------------------------------------------------------------
     # 5. Mobility annotation
     # ------------------------------------------------------------------
@@ -328,6 +401,8 @@ def run_pipeline(
                 mobility=mobility,
                 risk=risk,
                 taxonomy=taxonomy_by_contig.get(cid),
+                vf_hits=vf_by_contig.get(cid, []),
+                mge_hits=mge_by_contig.get(cid, []),
             )
         )
 
@@ -354,12 +429,16 @@ def run_pipeline(
         taxonomy=taxonomy_by_contig,
     )
     tax_classified = sum(1 for r in taxonomy_by_contig.values() if r.rank != "unclassified")
+    total_vf = sum(len(cr.vf_hits) for cr in plasmid_results)
+    total_mge = sum(len(cr.mge_hits) for cr in plasmid_results)
     logger.info(
-        "Pipeline complete — %d total | %d plasmid | %d ARGs | "
+        "Pipeline complete — %d total | %d plasmid | %d ARGs | %d VFs | %d MGEs | "
         "%d/%d taxonomy-classified | risk scores %s",
         result.total_sequences,
         result.total_plasmids,
         result.total_args,
+        total_vf,
+        total_mge,
         tax_classified,
         len(taxonomy_by_contig),
         sorted({cr.risk.score for cr in plasmid_results}),

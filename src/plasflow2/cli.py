@@ -448,6 +448,28 @@ def main(ctx: click.Context, verbose: bool) -> None:
         "Use 90%% for clinical-isolate-grade precision."
     ),
 )
+@click.option(
+    "--vfdb",
+    "vfdb",
+    default=None,
+    type=click.Path(),
+    help=(
+        "DIAMOND database (.dmnd) built from VFDB set A protein sequences. "
+        "When provided, annotates plasmid contigs with virulence factors. "
+        "Build with: diamond makedb --in VFDB_setA_pro.fas -d data/databases/vfdb/vfdb_setA"
+    ),
+)
+@click.option(
+    "--mge-db",
+    "mge_db",
+    default=None,
+    type=click.Path(),
+    help=(
+        "DIAMOND database (.dmnd) built from ISfinder transposase protein sequences. "
+        "When provided, detects IS elements and transposons on plasmid contigs. "
+        "Build with: diamond makedb --in ISfinder-sequences.fasta -d data/databases/mge/isfinder"
+    ),
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -467,6 +489,8 @@ def run(
     skip_taxonomy: bool,
     sarg_db: str | None,
     min_identity: float,
+    vfdb: str | None,
+    mge_db: str | None,
 ) -> None:
     """Run the full PlasFlow v2 pipeline: classify → annotate → risk → report.
 
@@ -508,6 +532,8 @@ def run(
         skip_taxonomy=skip_taxonomy,
         sarg_db=sarg_db,
         min_identity=min_identity,
+        vfdb=vfdb,
+        mge_db=mge_db,
     )
 
     # --- Write comprehensive predictions TSV (all contigs, all annotations) ---
