@@ -36,6 +36,11 @@ data/labels.npy
 data/seq_ids.txt
 data/dataset_stats.txt
 
+# Raw reads, QC output, and assemblies — large binary files
+data/raw/
+data/clean/
+data/assembly/
+
 # Test datasets — large genome files and computed outputs
 data/test/*.fna
 data/test/*.fa

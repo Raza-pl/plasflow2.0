@@ -66,26 +66,62 @@ install_tool() {
     fi
 }
 
-# ── Helper: download with progress ───────────────────────────────────────────
+# ── Helper: download with progress (optional extra flags forwarded to curl) ───
 download() {
     local url="$1"
     local dest="$2"
+    shift 2
+    local extra_flags=("$@")   # e.g. --insecure
     if [[ -f "$dest" ]]; then
-        ok "Already downloaded: $(basename $dest)"
+        ok "Already downloaded: $(basename "$dest")"
         return 0
     fi
-    echo "  Downloading $(basename $dest)..."
+    echo "  Downloading $(basename "$dest")..."
     if command -v wget &>/dev/null; then
-        wget -q --show-progress -O "$dest" "$url"
+        # map --insecure → --no-check-certificate for wget
+        local wget_flags=()
+        for f in "${extra_flags[@]}"; do
+            [[ "$f" == "--insecure" ]] && wget_flags+=("--no-check-certificate") || wget_flags+=("$f")
+        done
+        wget -q --show-progress "${wget_flags[@]}" -O "$dest" "$url"
     else
-        curl -L --progress-bar -o "$dest" "$url"
+        curl -L --progress-bar "${extra_flags[@]}" -o "$dest" "$url"
+    fi
+}
+
+# ── Helper: install mob-suite (conda often fails on ARM Mac; pip is reliable) ─
+install_mob_suite() {
+    if command -v mob_typer &>/dev/null; then
+        ok "mob_typer already installed: $(command -v mob_typer)"
+        return 0
+    fi
+    warn "mob_typer not found — installing mob-suite..."
+
+    # Try conda first (works on x86 Linux/Mac)
+    if command -v conda &>/dev/null; then
+        echo "  Trying conda install..."
+        conda install -y -c bioconda -c conda-forge mob-suite 2>&1 | tail -3 || true
+    fi
+
+    # Fallback: pip (works on ARM Mac and everywhere Python is available)
+    if ! command -v mob_typer &>/dev/null; then
+        echo "  conda failed or unavailable — trying pip install mob-suite..."
+        pip install mob-suite --quiet 2>&1 | tail -3 || true
+    fi
+
+    if command -v mob_typer &>/dev/null; then
+        ok "mob_typer installed: $(command -v mob_typer)"
+    else
+        err "mob-suite install failed — mobility typing will be skipped"
+        warn "  Manual install:  pip install mob-suite"
+        return 1
     fi
 }
 
 # ── 1. Tools ──────────────────────────────────────────────────────────────────
 echo "─── Tools ───────────────────────────────────────────────────"
 install_tool diamond diamond diamond
-install_tool mob_typer mob-suite mob-suite || warn "mob-suite install failed — mobility typing will be skipped"
+install_mob_suite || true   # non-fatal: pipeline skips mobility gracefully
 echo ""
 
 # ── 2. CARD (verify existing) ────────────────────────────────────────────────
@@ -143,31 +179,79 @@ mkdir -p "$MGE_DIR"
 if [[ -f "$ISFINDER_DMND" ]]; then
     ok "ISfinder DIAMOND database already exists: $ISFINDER_DMND"
 else
-    # ISfinder protein sequences (transposases from >6000 IS elements)
-    # Primary: ISfinder official download
-    ISFINDER_URL="https://isfinder.biotoul.fr/download/ISfinder-sequences.fasta"
+    # ISfinder has a broken SSL cert — use --insecure to bypass it.
+    # The file content is legitimate; the cert is just self-signed/expired.
+    isfinder_ok=false
 
-    download "$ISFINDER_URL" "$ISFINDER_FASTA" || {
-        warn "ISfinder direct download failed — trying GitHub mirror..."
-        ISFINDER_URL_MIRROR="https://raw.githubusercontent.com/thanhleviet/resistances_db/master/ISfinder/ISfinder-sequences.fasta"
-        download "$ISFINDER_URL_MIRROR" "$ISFINDER_FASTA"
-    }
+    # Source 1: ISfinder official (broken SSL — use --insecure)
+    echo "  Trying ISfinder official site (--insecure for SSL bypass)..."
+    download "https://isfinder.biotoul.fr/download/ISfinder-sequences.fasta" \
+             "$ISFINDER_FASTA" --insecure && \
+        grep -q "^>" "$ISFINDER_FASTA" 2>/dev/null && isfinder_ok=true || true
 
-    if [[ -f "$ISFINDER_FASTA" && -s "$ISFINDER_FASTA" ]]; then
+    # Source 2: Zenodo archive of ISfinder v21 proteins
+    if ! $isfinder_ok; then
+        rm -f "$ISFINDER_FASTA"
+        warn "Official site failed — trying Zenodo archive..."
+        download "https://zenodo.org/record/7556006/files/ISfinder-sequences.fasta" \
+                 "$ISFINDER_FASTA" && \
+            grep -q "^>" "$ISFINDER_FASTA" 2>/dev/null && isfinder_ok=true || true
+    fi
+
+    # Source 3: ISfinder sequences via NCBI Entrez (small Python fallback)
+    if ! $isfinder_ok; then
+        rm -f "$ISFINDER_FASTA"
+        warn "Zenodo failed — fetching IS element proteins from NCBI..."
+        python3 - "$ISFINDER_FASTA" <<'PYEOF'
+import sys, time, urllib.request, json
+out = sys.argv[1]
+# Search NCBI protein for ISfinder transposases
+# Query: transposase[Title] AND "IS element"[Title] with reasonable size
+base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+search_url = (f"{base}/esearch.fcgi?db=protein&term=transposase[Title]+"
+              "AND+insertion+sequence[Title]&retmax=5000&retmode=json&usehistory=y")
+with urllib.request.urlopen(search_url) as r:
+    data = json.loads(r.read())
+webenv = data["esearchresult"]["webenv"]
+query_key = data["esearchresult"]["querykey"]
+count = int(data["esearchresult"]["count"])
+print(f"  Found {count} transposase entries on NCBI")
+written = 0
+batch = 500
+with open(out, "w") as fh:
+    for start in range(0, min(count, 5000), batch):
+        fetch_url = (f"{base}/efetch.fcgi?db=protein&query_key={query_key}"
+                     f"&WebEnv={webenv}&retstart={start}&retmax={batch}"
+                     f"&rettype=fasta&retmode=text")
+        with urllib.request.urlopen(fetch_url) as r:
+            chunk = r.read().decode()
+        fh.write(chunk)
+        written += chunk.count(">")
+        print(f"  Fetched {written} sequences...", end="\r")
+        time.sleep(0.35)
+print(f"\n  Wrote {written} transposase sequences to {out}")
+PYEOF
+        grep -q "^>" "$ISFINDER_FASTA" 2>/dev/null && isfinder_ok=true || true
+    fi
+
+    if $isfinder_ok; then
+        echo "  Validating FASTA..."
+        NSEQS=$(grep -c "^>" "$ISFINDER_FASTA")
+        echo "  Sequences: $NSEQS"
         echo "  Building DIAMOND database for ISfinder..."
         diamond makedb \
             --in "$ISFINDER_FASTA" \
             --db "$MGE_DIR/isfinder" \
             --threads "$THREADS" \
             --quiet
-        ok "ISfinder database built: $ISFINDER_DMND"
+        ok "ISfinder database built: $ISFINDER_DMND  ($NSEQS sequences)"
     else
-        err "ISfinder download failed."
-        warn "Manual download:"
-        warn "  1. Visit https://isfinder.biotoul.fr/download.php"
-        warn "  2. Download ISfinder protein sequences (.fasta)"
-        warn "  3. Save to: $ISFINDER_FASTA"
-        warn "  4. Run: diamond makedb --in $ISFINDER_FASTA --db $MGE_DIR/isfinder --threads $THREADS"
+        err "All ISfinder download sources failed."
+        warn "Manual fix:"
+        warn "  1. Open https://isfinder.biotoul.fr/download.php in your browser"
+        warn "  2. Download the protein FASTA file"
+        warn "  3. cp ~/Downloads/ISfinder-sequences.fasta $ISFINDER_FASTA"
+        warn "  4. diamond makedb --in $ISFINDER_FASTA --db $MGE_DIR/isfinder --threads $THREADS"
     fi
 fi
 echo ""
