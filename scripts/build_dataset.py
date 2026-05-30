@@ -780,9 +780,14 @@ def main() -> None:
         # Reserve up to 60% of max_per_class for RefSeq chromosomes;
         # remaining 40% goes to metagenome contigs (if provided).
         refseq_cap = int(args.max_per_class * 0.60) if args.metagenome_dir else args.max_per_class
-        seqs, ids, labels = load_chrom_dir(
-            args.chrom_dir,
-            max_fragments=refseq_cap,
+        # Use streaming loader — loads one genome at a time into a reservoir.
+        # load_chrom_dir() loads all genomes at once and OOM-kills on 1000+ genomes.
+        chrom_files = _fasta_files_in_dir(args.chrom_dir)
+        logger.info("CHROMOSOME CLASS — RefSeq genomes (%d files, streaming)", len(chrom_files))
+        seqs, ids, labels = load_windowed_streaming(
+            chrom_files,
+            label="chromosome",
+            max_total=refseq_cap,
             min_length=args.min_length,
             seed=args.seed,
         )
