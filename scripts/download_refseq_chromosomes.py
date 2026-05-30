@@ -1,323 +1,193 @@
 #!/usr/bin/env python3
 """Download diverse RefSeq complete bacterial chromosomes for MLP retraining.
 
-The current PlasFlow v2 classifier was trained on chromosomal fragments from
-only 35 source genomes, which causes misclassification of species not well
-represented in the training set (e.g. Klebsiella pneumoniae).
+Uses the NCBI FTP assembly summary file (no Entrez API, no rate limits on
+the index itself) to find complete bacterial genomes, then downloads them
+directly via HTTPS.
 
-This script uses NCBI taxonomy IDs to bulk-search each major bacterial phylum
-for complete RefSeq assemblies, then downloads one genome per species for
-maximum diversity.  Default target: 10,000 genomes across 14 phyla.
+Why the old Entrez approach stopped working
+-------------------------------------------
+NCBI changed Entrez search behaviour so that phylum-level taxid queries
+("txid1224[Organism:exp]") return 0 hits for common phyla.  The FTP
+assembly_summary.txt file is updated daily and is the authoritative list.
 
-Phylum distribution (default --count 10000):
-    Pseudomonadota (Proteobacteria)  3000  — largest, most clinical relevance
-    Bacillota (Firmicutes)           2000
-    Actinomycetota (Actinobacteria)  1500
-    Bacteroidota                     1000
-    Campylobacterota                  500
-    Cyanobacteriota                   500
-    Spirochaetota                     300
-    Deinococcota                      200
-    Chloroflexota                     200
-    Chlamydiota                       200
-    Mycoplasmatota                    200
-    Fusobacteriota                    200
-    Thermotogota                      100
-    Aquificota + other                100
+Diversity strategy
+------------------
+- Reads assembly_summary.txt (~10 MB) for the bacteria RefSeq collection.
+- Keeps only "Complete Genome" assemblies (fully assembled chromosomes).
+- Deduplicates to ONE genome per species (species_taxid column) for maximum
+  taxonomic diversity.
+- Groups species by genus so you can see the phylum/class breakdown.
+- Samples up to --count genomes proportionally across genera, with a
+  per-genus cap to prevent one dominant genus (e.g. Salmonella) from
+  swamping the dataset.
 
-Disk space estimate:
-    ~4 MB per genome (uncompressed FASTA) × 10,000 = ~40 GB
-    Download bandwidth (gzipped): ~1.5 MB × 10,000 = ~15 GB transferred
-    Allow at least 50 GB free space before running.
+Key genera relevant to WWTP / environmental metagenomes
+--------------------------------------------------------
+    Proteobacteria:   Pseudomonas, Escherichia, Klebsiella, Acinetobacter,
+                      Comamonas, Nitrosomonas, Nitrobacter, Burkholderiales
+    Firmicutes:       Bacillus, Clostridium, Enterococcus, Staphylococcus
+    Actinobacteria:   Mycobacterium, Corynebacterium, Rhodococcus
+    Bacteroidota:     Bacteroides, Flavobacterium, Sphingobacterium
+    Others:           Planctomycetes, Chloroflexi, Verrucomicrobia
 
-NCBI rate limits:
-    Without API key: 3 requests/second → ~3 hours for 10,000 genomes
-    With API key:   10 requests/second → ~1 hour for 10,000 genomes
-    Register for a free NCBI API key at:
-    https://www.ncbi.nlm.nih.gov/account/
+Disk space: ~4 MB/genome × 2000 = ~8 GB
 
 Usage:
-    # Download 10,000 diverse genomes (~40 GB total, ~3 hours without API key)
-    python scripts/download_refseq_chromosomes.py --outdir data/chromosomes/
-
-    # Faster with NCBI API key
     python scripts/download_refseq_chromosomes.py \\
-        --outdir data/chromosomes/ --api-key YOUR_KEY_HERE
+        --count 2000 --outdir data/chromosomes/ --email you@example.com
 
-    # Smaller run for quick testing
-    python scripts/download_refseq_chromosomes.py --count 200 --outdir data/chromosomes/
-
-    # Dry run — see what would be fetched without downloading
-    python scripts/download_refseq_chromosomes.py --dry-run --count 100
-
-    # Single phylum only
+    # Dry run — print what would be downloaded without fetching
     python scripts/download_refseq_chromosomes.py \\
-        --phylum Pseudomonadota --count 3000 --outdir data/chromosomes/
+        --count 200 --outdir data/chromosomes/ --dry-run
 
-After downloading, retrain the MLP:
-    python scripts/build_dataset.py \\
-        --plasmid-dir   data/databases/plasmidscope/ \\
-        --chrom-dir     data/chromosomes/ \\
-        --metagenome-dir data/metagenomes/ \\
-        --data-dir      data/databases/ \\
-        --max-per-class 75000 \\
-        --out           data/
-
-    python scripts/train_model.py \\
-        --mlp --data data/features.npy --labels data/labels.npy \\
-        --epochs 50 --output data/models/mlp_v2.pt
+After downloading, rebuild and retrain:
+    bash scripts/retrain_with_more_chromosomes.sh --count 2000
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import gzip
-import math
-import sys
+import logging
+import random
 import time
 import urllib.request
-from dataclasses import dataclass, field
+from collections import defaultdict
 from pathlib import Path
 
-from Bio import Entrez  # type: ignore[import]
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
-Entrez.email = "plasflow2@example.com"
-Entrez.tool = "plasflow2"
-# Entrez.api_key is set at runtime from --api-key if provided
+ASSEMBLY_SUMMARY_URL = "https://ftp.ncbi.nlm.nih.gov/genomes/refseq/bacteria/assembly_summary.txt"
 
-
-# ---------------------------------------------------------------------------
-# Phylum definitions
-# Each entry: (display_name, NCBI_taxid, fraction_of_total_count)
-# Fractions sum to 1.0; actual counts are scaled by --count at runtime.
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class Phylum:
-    name: str  # display name
-    taxid: int  # NCBI taxonomy ID
-    fraction: float  # share of the total --count budget
-
-
-PHYLA: list[Phylum] = [
-    # Name                       taxid    fraction
-    Phylum("Pseudomonadota", 1224, 0.30),  # Proteobacteria — huge clinical relevance
-    Phylum("Bacillota", 1239, 0.20),  # Firmicutes
-    Phylum("Actinomycetota", 201174, 0.15),  # Actinobacteria
-    Phylum("Bacteroidota", 976, 0.10),  # Bacteroidetes
-    Phylum("Campylobacterota", 29547, 0.05),  # Epsilonproteobacteria (Campylobacter/Helicobacter)
-    Phylum("Cyanobacteriota", 1117, 0.05),  # Cyanobacteria
-    Phylum("Spirochaetota", 203691, 0.03),  # Spirochetes
-    Phylum("Deinococcota", 188787, 0.02),  # Deinococcus-Thermus
-    Phylum("Chloroflexota", 200795, 0.02),  # Chloroflexi
-    Phylum("Chlamydiota", 204428, 0.02),  # Chlamydiae
-    Phylum("Mycoplasmatota", 2093, 0.02),  # Tenericutes / Mycoplasma
-    Phylum("Fusobacteriota", 32066, 0.02),  # Fusobacteria
-    Phylum("Thermotogota", 200918, 0.01),  # Thermotoga
-    Phylum("Aquificota", 200783, 0.01),  # Aquificae
-]
-# Fractions sum to 1.0 (30+20+15+10+5+5+3+2+2+2+2+2+1+1 = 100%)
+# Cap per genus — prevents one over-represented genus from dominating
+MAX_PER_GENUS = 30
 
 
 # ---------------------------------------------------------------------------
-# NCBI helpers
+# Step 1: fetch and parse assembly summary
 # ---------------------------------------------------------------------------
 
 
-def _search_by_taxid(taxid: int, max_results: int) -> list[str]:
-    """Return up to *max_results* Assembly UIDs for *taxid* (RefSeq complete genomes).
+def fetch_assembly_summary() -> list[dict]:
+    """Download assembly_summary.txt and return rows for Complete Genomes."""
+    logger.info("Downloading NCBI RefSeq bacteria assembly summary (~10 MB)…")
+    with urllib.request.urlopen(ASSEMBLY_SUMMARY_URL, timeout=60) as resp:
+        raw = resp.read().decode("utf-8")
 
-    Searches RefSeq only (excludes GenBank-only entries) for assemblies at
-    'Complete Genome' level, with the 'latest' status filter so superseded
-    assemblies are excluded.
-    """
-    query = (
-        f"txid{taxid}[Organism:exp] "
-        f'AND "Complete Genome"[Assembly Level] '
-        f'AND "latest"[filter] '
-        f'AND "RefSeq"[Filter]'
+    lines = raw.splitlines()
+    # First line is a comment starting with '#', second line has column headers
+    # starting with '# assembly_accession' → strip leading '#'
+    header_line = next(line for line in lines if line.startswith("#"))
+    header = header_line.lstrip("# ").split("\t")
+    data_lines = [line for line in lines if line and not line.startswith("#")]
+
+    reader = csv.DictReader(data_lines, fieldnames=header, delimiter="\t")
+    rows = []
+    for row in reader:
+        if (
+            row.get("assembly_level") == "Complete Genome"
+            and row.get("version_status", "").lower() == "latest"
+            and row.get("ftp_path", "na") not in ("na", "")
+        ):
+            rows.append(row)
+
+    logger.info("Complete Genome assemblies (latest): %d", len(rows))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Step 2: deduplicate and sample
+# ---------------------------------------------------------------------------
+
+
+def _genus_from_name(organism_name: str) -> str:
+    """Extract genus from organism name, e.g. 'Escherichia coli K-12' → 'Escherichia'."""
+    return organism_name.split()[0] if organism_name else "Unknown"
+
+
+def select_assemblies(rows: list[dict], count: int, seed: int = 42) -> list[dict]:
+    """Pick up to *count* assemblies, one per species, capped per genus."""
+    rng = random.Random(seed)
+
+    # Deduplicate: one assembly per species_taxid (pick randomly among available)
+    by_species: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        by_species[row.get("species_taxid", row["taxid"])].append(row)
+
+    species_reps: list[dict] = []
+    for sp_rows in by_species.values():
+        species_reps.append(rng.choice(sp_rows))
+
+    logger.info("Unique species (one genome each): %d", len(species_reps))
+
+    # Group by genus and apply per-genus cap
+    by_genus: dict[str, list[dict]] = defaultdict(list)
+    for row in species_reps:
+        genus = _genus_from_name(row.get("organism_name", ""))
+        by_genus[genus].append(row)
+
+    capped: list[dict] = []
+    for _genus, genus_rows in sorted(by_genus.items()):
+        rng.shuffle(genus_rows)
+        capped.extend(genus_rows[:MAX_PER_GENUS])
+
+    logger.info(
+        "After per-genus cap (%d): %d assemblies across %d genera",
+        MAX_PER_GENUS,
+        len(capped),
+        len(by_genus),
     )
-    handle = Entrez.esearch(db="assembly", term=query, retmax=max_results, sort="relevance")
-    record = Entrez.read(handle)
-    handle.close()
-    return list(record.get("IdList", []))
 
-
-def _batch_esummary(uids: list[str]) -> list[dict]:  # type: ignore[type-arg]
-    """Fetch esummary for a batch of UIDs; returns list of DocumentSummary dicts."""
-    if not uids:
-        return []
-    handle = Entrez.esummary(db="assembly", id=",".join(uids))
-    doc = Entrez.read(handle, validate=False)
-    handle.close()
-    return list(doc["DocumentSummarySet"]["DocumentSummary"])
-
-
-def _ftp_to_https(url: str) -> str:
-    return url.replace("ftp://", "https://")
-
-
-def _download_fasta(ftp_path: str, out_dir: Path, accession: str) -> Path | None:
-    """Download and decompress the genomic FASTA for *ftp_path* into *out_dir*."""
-    basename = ftp_path.rstrip("/").split("/")[-1]
-    gz_name = f"{basename}_genomic.fna.gz"
-    fna_name = f"{accession}_genomic.fna"
-    out_fna = out_dir / fna_name
-
-    if out_fna.exists():
-        return out_fna  # already downloaded
-
-    url = _ftp_to_https(f"{ftp_path}/{gz_name}")
-    out_gz = out_dir / gz_name
-
-    try:
-
-        def _progress(block: int, bs: int, total: int) -> None:
-            if total > 0:
-                pct = min(100, block * bs * 100 // total)
-                print(f"\r    {pct}%", end="", flush=True)
-
-        urllib.request.urlretrieve(url, out_gz, reporthook=_progress)
-        print()
-    except Exception as exc:
-        print(f"\n    Download failed: {exc}")
-        if out_gz.exists():
-            out_gz.unlink()
-        return None
-
-    try:
-        with gzip.open(out_gz, "rb") as fin, open(out_fna, "wb") as fout:
-            while chunk := fin.read(1 << 20):
-                fout.write(chunk)
-        out_gz.unlink()
-    except Exception as exc:
-        print(f"    Decompress failed: {exc}")
-        for p in (out_gz, out_fna):
-            if p.exists():
-                p.unlink()
-        return None
-
-    return out_fna
+    # Final random sample
+    rng.shuffle(capped)
+    selected = capped[:count]
+    logger.info("Selected %d assemblies for download", len(selected))
+    return selected
 
 
 # ---------------------------------------------------------------------------
-# Per-phylum downloader
+# Step 3: download
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class PhylumResult:
-    name: str
-    target: int
-    downloaded: list[Path] = field(default_factory=list)
-    skipped: int = 0  # no FTP path
-    failed: int = 0
-    already: int = 0  # pre-existing on disk
+def _ftp_to_https(ftp_path: str) -> str:
+    """Convert ftp:// NCBI path to https:// equivalent."""
+    return ftp_path.replace("ftp://", "https://", 1)
 
 
-def _process_phylum(
-    phylum: Phylum,
-    target: int,
-    out_dir: Path,
-    delay: float,
-    dry_run: bool,
-    verbose: bool,
-) -> PhylumResult:
-    """Fetch up to *target* genomes for *phylum*, one per species."""
-    result = PhylumResult(name=phylum.name, target=target)
-    if target == 0:
-        return result
+def download_genome(row: dict, out_dir: Path) -> bool:
+    """Download genomic FNA for one assembly. Returns True on success."""
+    acc = row["assembly_accession"]
+    asm_name = row.get("asm_name", "").replace(" ", "_")
+    ftp_base = _ftp_to_https(row["ftp_path"].rstrip("/"))
+    # NCBI FTP convention: the genomic FASTA is named {acc}_{asm_name}_genomic.fna.gz
+    fname = f"{acc}_{asm_name}_genomic.fna.gz"
+    url = f"{ftp_base}/{fname}"
+    dest_gz = out_dir / fname
+    dest_fa = out_dir / fname.replace(".fna.gz", ".fna")
 
-    print(f"\n{'─' * 60}")
-    print(f"  {phylum.name}  (taxid {phylum.taxid})  target={target}")
-    print(f"{'─' * 60}")
-
-    # Fetch more UIDs than we need to have spares after deduplication.
-    # NCBI retmax is capped at 10,000; we fetch up to 4× target for headroom.
-    fetch_limit = min(10_000, max(target * 4, 50))
+    if dest_fa.exists():
+        return True  # already downloaded
 
     try:
-        uids = _search_by_taxid(phylum.taxid, fetch_limit)
-        time.sleep(delay)
+        urllib.request.urlretrieve(url, str(dest_gz))
+        # Decompress
+        with gzip.open(dest_gz, "rb") as gz_in, open(dest_fa, "wb") as fa_out:
+            fa_out.write(gz_in.read())
+        dest_gz.unlink()
+        return True
     except Exception as exc:
-        print(f"  NCBI search failed: {exc}", file=sys.stderr)
-        result.failed += target
-        return result
-
-    if not uids:
-        print("  No RefSeq complete genomes found for this phylum.")
-        return result
-
-    if verbose:
-        print(f"  Found {len(uids)} candidate assemblies")
-
-    # Fetch summaries in batches of 200 (NCBI limit)
-    summaries: list[dict] = []  # type: ignore[type-arg]
-    batch_size = 200
-    for start in range(0, len(uids), batch_size):
-        batch = uids[start : start + batch_size]
-        try:
-            summaries.extend(_batch_esummary(batch))
-            time.sleep(delay)
-        except Exception as exc:
-            print(f"  esummary batch failed: {exc}", file=sys.stderr)
-
-    # Deduplicate: one assembly per species (keep first hit per SpeciesName)
-    seen_species: set[str] = set()
-    unique_summaries: list[dict] = []  # type: ignore[type-arg]
-    for s in summaries:
-        sp = str(s.get("SpeciesName", "")).strip().lower()
-        if sp and sp not in seen_species:
-            seen_species.add(sp)
-            unique_summaries.append(s)
-
-    if verbose:
-        print(f"  {len(unique_summaries)} unique species after deduplication")
-
-    downloaded_this = 0
-    for s in unique_summaries:
-        if downloaded_this >= target:
-            break
-
-        accession: str = str(s.get("AssemblyAccession", ""))
-        organism: str = str(s.get("SpeciesName", s.get("Organism", "unknown")))
-        ftp: str = str(s.get("FtpPath_RefSeq", "") or s.get("FtpPath_GenBank", ""))
-
-        # Skip if already on disk
-        existing = list(out_dir.glob(f"{accession}_genomic.fna"))
-        if existing:
-            print(
-                f"  [{downloaded_this + 1:4d}/{target}]  {accession}  {organism}  — already on disk"
-            )
-            result.already += 1
-            result.downloaded.extend(existing)
-            downloaded_this += 1
-            continue
-
-        if not ftp or ftp == "na":
-            if verbose:
-                print(f"  {accession}  {organism}  — no FTP path, skipping")
-            result.skipped += 1
-            continue
-
-        print(f"  [{downloaded_this + 1:4d}/{target}]  {accession}  {organism}")
-
-        if dry_run:
-            print(f"    [dry-run] {_ftp_to_https(ftp)}")
-            downloaded_this += 1
-            continue
-
-        fna = _download_fasta(ftp, out_dir, accession)
-        if fna:
-            size_mb = fna.stat().st_size / 1_000_000
-            print(f"    → {fna.name}  ({size_mb:.1f} MB)")
-            result.downloaded.append(fna)
-            downloaded_this += 1
-        else:
-            result.failed += 1
-
-    return result
+        logger.debug("Failed %s: %s", acc, exc)
+        if dest_gz.exists():
+            dest_gz.unlink(missing_ok=True)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -327,175 +197,98 @@ def _process_phylum(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Download diverse RefSeq complete bacterial chromosomes."
+    )
+    parser.add_argument(
+        "--count", type=int, default=2000, help="Number of genomes to download (default: 2000)."
     )
     parser.add_argument(
         "--outdir",
         default="data/chromosomes/",
-        type=Path,
-        help="Directory to save downloaded FASTA files (default: data/chromosomes/).",
+        help="Output directory (default: data/chromosomes/).",
     )
     parser.add_argument(
-        "--count",
-        type=int,
-        default=10000,
-        help=(
-            "Total number of genomes to download across all phyla "
-            "(default: 10000). Distributed proportionally per phylum. "
-            "~40 GB disk space required for 10,000 genomes."
-        ),
+        "--email", default="plasflow2@example.com", help="Email for NCBI (informational only)."
     )
     parser.add_argument(
-        "--phylum",
-        default=None,
-        help=(
-            "Download only genomes from this phylum "
-            "(e.g. Pseudomonadota). Downloads --count genomes from that phylum only."
-        ),
+        "--seed", type=int, default=42, help="Random seed for reproducible sampling."
     )
     parser.add_argument(
-        "--email",
-        default="plasflow2@example.com",
-        help="Email address for NCBI Entrez (required by NCBI policy).",
+        "--dry-run", action="store_true", help="Print selected assemblies without downloading."
     )
     parser.add_argument(
-        "--api-key",
-        default=None,
-        help=(
-            "NCBI API key for higher rate limits (10 req/s vs 3 req/s). "
-            "Register free at https://www.ncbi.nlm.nih.gov/account/ — "
-            "strongly recommended for --count >= 5000."
-        ),
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print what would be downloaded without actually downloading.",
-    )
-    parser.add_argument(
-        "--delay",
-        type=float,
-        default=0.4,
-        help="Seconds between NCBI API calls to respect rate limits (default: 0.4).",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print extra diagnostics (candidate counts, dedup stats).",
+        "--delay", type=float, default=0.2, help="Seconds between downloads (default: 0.2)."
     )
     args = parser.parse_args()
 
-    Entrez.email = args.email
-    if args.api_key:
-        Entrez.api_key = args.api_key
-        # With an API key NCBI allows 10 req/s; use a tighter delay
-        if args.delay >= 0.4:
-            args.delay = 0.12
-        print(f"NCBI API key set — using {args.delay:.2f}s delay between requests.")
-    elif args.count >= 5000:
-        print(
-            "WARNING: Downloading {:,} genomes without an NCBI API key may take 3+ hours "
-            "and risks rate-limit errors.\n"
-            "         Pass --api-key YOUR_KEY for 3× faster downloads.\n"
-            "         Register free at https://www.ncbi.nlm.nih.gov/account/".format(args.count)
-        )
-    args.outdir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.outdir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Select phyla
-    active_phyla = PHYLA
-    if args.phylum:
-        active_phyla = [p for p in PHYLA if p.name.lower() == args.phylum.lower()]
-        if not active_phyla:
-            available = ", ".join(p.name for p in PHYLA)
-            print(
-                f"Unknown phylum '{args.phylum}'. Available: {available}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+    print("PlasFlow v2 — RefSeq chromosome downloader (FTP summary method)")
+    print(f"  Target  : {args.count} genomes")
+    print(f"  Output  : {out_dir.resolve()}")
+    print()
 
-    # Compute per-phylum targets — proportional, at least 1 each if count allows
-    total = args.count
-    # Re-normalise fractions in case --phylum selected a subset
-    total_fraction = sum(p.fraction for p in active_phyla)
-    per_phylum_targets: dict[str, int] = {}
-    allocated = 0
-    for ph in active_phyla:
-        share = int(math.floor(total * ph.fraction / total_fraction))
-        per_phylum_targets[ph.name] = max(1, share)
-        allocated += per_phylum_targets[ph.name]
+    # 1. Fetch index
+    rows = fetch_assembly_summary()
 
-    # Distribute any rounding remainder to the largest phylum
-    remainder = total - allocated
-    if remainder > 0 and active_phyla:
-        largest = max(active_phyla, key=lambda p: p.fraction)
-        per_phylum_targets[largest.name] += remainder
+    # 2. Select diverse subset
+    selected = select_assemblies(rows, args.count, seed=args.seed)
 
-    print("PlasFlow v2 — RefSeq chromosome bulk downloader")
-    print(f"Target    : {total} genomes")
-    print(f"Output    : {args.outdir}")
+    # Print genus breakdown
+    by_genus: dict[str, int] = defaultdict(int)
+    for row in selected:
+        by_genus[_genus_from_name(row.get("organism_name", ""))] += 1
+    top = sorted(by_genus.items(), key=lambda x: -x[1])[:20]
+    print("Top genera in selection:")
+    for genus, cnt in top:
+        print(f"  {genus:<30s} {cnt:3d}")
+    print(f"  … and {len(by_genus) - 20} more genera" if len(by_genus) > 20 else "")
+    print()
+
     if args.dry_run:
-        print("Mode      : DRY RUN (no files will be written)")
-    print("\nPhylum breakdown:")
-    for ph in active_phyla:
-        print(f"  {ph.name:<25s}  {per_phylum_targets[ph.name]:4d}  (taxid {ph.taxid})")
+        print(f"[dry-run] Would download {len(selected)} assemblies.")
+        for row in selected[:20]:
+            print(f"  {row['assembly_accession']}  {row.get('organism_name','')[:60]}")
+        return
 
-    all_results: list[PhylumResult] = []
-
-    for ph in active_phyla:
-        res = _process_phylum(
-            phylum=ph,
-            target=per_phylum_targets[ph.name],
-            out_dir=args.outdir,
-            delay=args.delay,
-            dry_run=args.dry_run,
-            verbose=args.verbose,
-        )
-        all_results.append(res)
-
-    # ── Final summary ────────────────────────────────────────────────────────
-    total_downloaded = sum(len(r.downloaded) for r in all_results)
-    total_already = sum(r.already for r in all_results)
-    total_skipped = sum(r.skipped for r in all_results)
-    total_failed = sum(r.failed for r in all_results)
-
-    print(f"\n{'=' * 60}")
-    print(f"{'PHYLUM':<25s}  {'TARGET':>6}  {'GOT':>6}  {'SKIP':>5}  {'FAIL':>5}")
-    print(f"{'─' * 60}")
-    for r in all_results:
-        print(
-            f"{r.name:<25s}  {r.target:>6d}  {len(r.downloaded):>6d}"
-            f"  {r.skipped:>5d}  {r.failed:>5d}"
-        )
-    print(f"{'─' * 60}")
-    print(
-        f"{'TOTAL':<25s}  {total:>6d}  {total_downloaded:>6d}"
-        f"  {total_skipped:>5d}  {total_failed:>5d}"
+    # 3. Download
+    already = sum(
+        1
+        for row in selected
+        if (
+            out_dir
+            / f"{row['assembly_accession']}_{row.get('asm_name','').replace(' ','_')}_genomic.fna"
+        ).exists()
     )
-    print(f"  (of which already on disk: {total_already})")
+    print(f"Already on disk: {already} / {len(selected)}")
 
-    if not args.dry_run and total_downloaded > 0:
-        new_files = [p for r in all_results for p in r.downloaded]
-        total_mb = sum(p.stat().st_size for p in new_files if p.exists()) / 1_000_000
-        print(f"\nTotal disk usage: {total_mb:.0f} MB in {args.outdir}")
-        print("\nNext steps — retrain the MLP:")
-        print("  # (Optional) Download 3 metagenome assemblies (>300K contigs each):")
-        print("  python scripts/download_metagenome_assemblies.py \\")
-        print("    --outdir data/metagenomes/")
-        print("")
-        print("  # Build training dataset:")
-        print("  python scripts/build_dataset.py \\")
-        print("    --plasmid-dir    data/databases/plasmidscope/ \\")
-        print(f"    --chrom-dir      {args.outdir} \\")
-        print("    --metagenome-dir data/metagenomes/ \\")
-        print("    --data-dir       data/databases/ \\")
-        print("    --max-per-class  75000 \\")
-        print("    --out            data/")
-        print("")
-        print("  # Train MLP:")
-        print("  python scripts/train_model.py \\")
-        print("    --mlp --data data/features.npy --labels data/labels.npy \\")
-        print("    --epochs 50 --output data/models/mlp_v2.pt")
+    ok_count = already
+    fail_count = 0
+    for row in selected:
+        acc = row["assembly_accession"]
+        org = row.get("organism_name", "")[:45]
+        dest_fa = out_dir / f"{acc}_{row.get('asm_name','').replace(' ','_')}_genomic.fna"
+        if dest_fa.exists():
+            continue
+        success = download_genome(row, out_dir)
+        if success:
+            ok_count += 1
+            print(f"  [{ok_count:4d}/{len(selected)}] {acc}  {org}")
+        else:
+            fail_count += 1
+            logger.warning("  [FAIL] %s  %s", acc, org)
+        time.sleep(args.delay)
+
+    print()
+    print("=" * 60)
+    print(f"  Downloaded : {ok_count}")
+    print(f"  Failed     : {fail_count}")
+    print(f"  Output     : {out_dir.resolve()}")
+    print()
+    print("Next: rebuild dataset and retrain")
+    print("  bash scripts/retrain_with_more_chromosomes.sh --count 2000")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
