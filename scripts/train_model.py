@@ -1,14 +1,31 @@
 """Train the PlasFlow v2 classifier (Random Forest + MLP).
 
-Week 2 — Days 10–11 implementation target.
-
 Usage:
-    python scripts/train_model.py --data data/features.npy --labels data/labels.npy
+    python scripts/train_model.py --data data/features.npy --labels data/labels.npy --mlp
+    python scripts/train_model.py --data data/features.npy --labels data/labels.npy --rf
+
+Memory strategy for MLP on macOS ARM
+--------------------------------------
+With 400k samples × 1281 features the numpy array is ~2 GB.
+sklearn's train_test_split copies the full array, so the naive approach
+peaks at 4+ GB and triggers macOS memory-pressure → segfault.
+
+Fix: split by *indices* (3.2 MB) first, then load only the train/val
+slices from a memory-mapped .npy file — never holding the full array in RAM.
+
+    y_all:   400k × 8 B  = 3.2 MB     (load fully — trivial)
+    X_mmap:  400k × 1281 × 4 B        (memory-mapped from disk)
+    X_tr:    320k × 1281 × 4 B = 1.64 GB  (contiguous slice → RAM)
+    X_va:    40k  × 1281 × 4 B = 0.21 GB  (contiguous slice → RAM)
+
+Peak RAM during training: X_tr + X_va ≈ 1.85 GB (shared with torch via
+from_numpy, no copy).  Test evaluation is skipped — use val accuracy instead.
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 from pathlib import Path
 
@@ -16,94 +33,40 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-
-def train_rf(X_train, y_train, n_estimators: int = 500):
-    """Train Random Forest classifier.
-
-    TODO (Day 10): implement full training with cross-validation.
-    """
-    from sklearn.ensemble import RandomForestClassifier  # type: ignore[import]
-
-    rf = RandomForestClassifier(
-        n_estimators=n_estimators,
-        max_features="sqrt",
-        n_jobs=-1,
-        random_state=42,
-    )
-    rf.fit(X_train, y_train)
-    return rf
-
-
-def train_mlp(X_train, y_train, epochs: int = 50, batch_size: int = 512, lr: float = 1e-3):
-    """Train PyTorch MLP on MPS/CUDA/CPU.
-
-    TODO (Day 11): implement training loop with AdamW + cosine LR.
-    """
-    import torch
-    from plasflow2.classify.model import PlasFlowMLP
-    from plasflow2.utils.device import get_device
-    from torch.utils.data import DataLoader, TensorDataset
-
-    device = get_device()
-    model = PlasFlowMLP(input_dim=X_train.shape[1]).to(device)
-
-    X_t = torch.tensor(X_train).float()
-    y_t = torch.tensor(y_train).long()
-    loader = DataLoader(
-        TensorDataset(X_t, y_t), batch_size=batch_size, shuffle=True, num_workers=0
-    )  # num_workers=0 required for MPS
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    criterion = torch.nn.CrossEntropyLoss()
-
-    for epoch in range(1, epochs + 1):
-        model.train()
-        total_loss = 0.0
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            optimizer.zero_grad()
-            loss = criterion(model(xb), yb)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        scheduler.step()
-        if epoch % 10 == 0:
-            logger.info("Epoch %d/%d — loss %.4f", epoch, epochs, total_loss / len(loader))
-
-    return model
+_SEED = 42
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Train PlasFlow v2 models")
-    parser.add_argument("--data", required=True, help="Feature matrix (.npy)")
+    parser.add_argument("--data",   required=True, help="Feature matrix (.npy)")
     parser.add_argument("--labels", required=True, help="Labels array (.npy)")
-    parser.add_argument("--out", default="data/models", help="Output directory")
-    parser.add_argument("--rf", action="store_true", help="Train Random Forest")
-    parser.add_argument("--mlp", action="store_true", help="Train MLP")
+    parser.add_argument("--out",    default="data/models", help="Output directory")
+    parser.add_argument("--rf",     action="store_true", help="Train Random Forest")
+    parser.add_argument("--mlp",    action="store_true", help="Train MLP")
     parser.add_argument("--epochs", type=int, default=50)
     args = parser.parse_args()
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    X = np.load(args.data).astype(np.float32)
-    y = np.load(args.labels).astype(np.int64)
-    logger.info("Loaded X=%s  y=%s", X.shape, y.shape)
-
+    # ── Random Forest ────────────────────────────────────────────────────────
     if args.rf:
         import time
 
         from plasflow2.classify.train import evaluate, save_rf, split_data
-        from plasflow2.classify.train import train_rf as _train_rf  # use library version
+        from plasflow2.classify.train import train_rf as _train_rf
         from plasflow2.utils.device import IDX_TO_CLASS
+
+        X = np.load(args.data).astype(np.float32)
+        y = np.load(args.labels).astype(np.int64)
+        logger.info("Loaded X=%s  y=%s", X.shape, y.shape)
 
         logger.info("Splitting data …")
         X_tr, X_va, X_te, y_tr, y_va, y_te = split_data(X, y, val_size=0.1, test_size=0.1)
         logger.info("Train=%d  Val=%d  Test=%d", len(X_tr), len(X_va), len(X_te))
 
-        logger.info("Training Random Forest (500 trees, n_jobs=-1) …")
+        logger.info("Training Random Forest (500 trees) …")
         t0 = time.time()
         rf = _train_rf(X_tr, y_tr, cv_folds=0)
         logger.info("RF trained in %.1f s", time.time() - t0)
@@ -115,27 +78,66 @@ def main() -> None:
 
         save_rf(rf, out_dir / "rf_v2.pkl")
 
+    # ── MLP ──────────────────────────────────────────────────────────────────
     if args.mlp:
         import time
 
+        from sklearn.model_selection import train_test_split  # type: ignore[import]
+
         from plasflow2.classify.model import save_model
-        from plasflow2.classify.train import evaluate, split_data
         from plasflow2.classify.train import train_mlp as _train_mlp
         from plasflow2.utils.device import IDX_TO_CLASS
 
-        import gc
+        # ── Step 1: split INDICES (not data) — 3 MB, trivially fast ─────────
+        logger.info("Loading labels and splitting by index …")
+        y_all = np.load(args.labels).astype(np.int64)
+        n = len(y_all)
+        logger.info("Total samples: %d", n)
 
-        logger.info("Splitting data …")
-        X_tr, X_va, X_te, y_tr, y_va, y_te = split_data(X, y, val_size=0.1, test_size=0.1)
-        logger.info("Train=%d  Val=%d  Test=%d", len(X_tr), len(X_va), len(X_te))
+        idx_all = np.arange(n)
+        idx_trainval, idx_te, y_trainval, _ = train_test_split(
+            idx_all, y_all,
+            test_size=0.10,
+            stratify=y_all,
+            random_state=_SEED,
+        )
+        idx_tr, idx_va, y_tr, y_va = train_test_split(
+            idx_trainval, y_trainval,
+            test_size=0.10 / 0.90,
+            stratify=y_trainval,
+            random_state=_SEED,
+        )
+        # Free everything we do not need before touching the feature matrix
+        del idx_all, y_all, idx_trainval, y_trainval, idx_te
+        gc.collect()
+        logger.info(
+            "Split (index-only): Train=%d  Val=%d  (test skipped — use val accuracy)",
+            len(idx_tr), len(idx_va),
+        )
 
-        # Free the full X and test arrays — not needed during training.
-        # On macOS, keeping 4+ GB of numpy arrays alive alongside torch
-        # tensors triggers memory pressure and a segfault.
-        del X, y, X_te, y_te
+        # ── Step 2: load only train+val slices from memory-mapped array ─────
+        # X_mmap is disk-backed — reading a slice copies only that slice
+        logger.info("Memory-mapping feature file and loading train/val slices …")
+        X_mmap = np.load(args.data, mmap_mode="r")
+        logger.info("Feature matrix shape: %s  dtype: %s", X_mmap.shape, X_mmap.dtype)
+
+        X_tr = np.ascontiguousarray(X_mmap[idx_tr]).astype(np.float32)
+        logger.info("X_tr loaded: %.2f GB", X_tr.nbytes / 1e9)
+
+        X_va = np.ascontiguousarray(X_mmap[idx_va]).astype(np.float32)
+        logger.info("X_va loaded: %.2f GB", X_va.nbytes / 1e9)
+
+        # Release the mmap and index arrays before PyTorch allocates anything
+        del X_mmap, idx_tr, idx_va
         gc.collect()
 
-        logger.info("Training MLP (AdamW + cosine LR + early stopping) …")
+        # ── Step 3: train ─────────────────────────────────────────────────────
+        logger.info(
+            "Training MLP (AdamW + cosine LR + early stopping) …\n"
+            "  RAM in use: X_tr=%.2f GB  X_va=%.2f GB  (total ≈%.2f GB)",
+            X_tr.nbytes / 1e9, X_va.nbytes / 1e9,
+            (X_tr.nbytes + X_va.nbytes) / 1e9,
+        )
         t0 = time.time()
         model = _train_mlp(
             X_tr, y_tr, X_va, y_va,
@@ -144,23 +146,13 @@ def main() -> None:
             lr=1e-3,
             patience=10,
         )
-        logger.info("MLP trained in %.1f s", time.time() - t0)
+        elapsed = time.time() - t0
+        logger.info("MLP trained in %.1f s (%.1f min)", elapsed, elapsed / 60)
 
-        import torch
-
-        class_names = [IDX_TO_CLASS[i] for i in sorted(IDX_TO_CLASS)]
-        from plasflow2.utils.device import get_device
-
-        device = get_device()
-        with torch.no_grad():
-            y_pred_mlp = (
-                model(torch.tensor(X_te).float().to(device)).argmax(dim=-1).cpu().numpy()
-            )
-        result = evaluate(y_te, y_pred_mlp, class_names=class_names)
-        logger.info("Test accuracy: %.4f", result["accuracy"])
-        logger.info("\n%s", result["report"])
-
-        save_model(model, out_dir / "mlp_v2.pt")
+        # ── Step 4: save ──────────────────────────────────────────────────────
+        model_path = out_dir / "mlp_v2.pt"
+        save_model(model, model_path)
+        logger.info("Model saved → %s", model_path)
 
 
 if __name__ == "__main__":
