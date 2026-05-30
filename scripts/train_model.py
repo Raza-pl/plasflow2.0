@@ -123,9 +123,17 @@ def main() -> None:
         from plasflow2.classify.train import train_mlp as _train_mlp
         from plasflow2.utils.device import IDX_TO_CLASS
 
+        import gc
+
         logger.info("Splitting data …")
         X_tr, X_va, X_te, y_tr, y_va, y_te = split_data(X, y, val_size=0.1, test_size=0.1)
         logger.info("Train=%d  Val=%d  Test=%d", len(X_tr), len(X_va), len(X_te))
+
+        # Free the full X and test arrays — not needed during training.
+        # On macOS, keeping 4+ GB of numpy arrays alive alongside torch
+        # tensors triggers memory pressure and a segfault.
+        del X, y, X_te, y_te
+        gc.collect()
 
         logger.info("Training MLP (AdamW + cosine LR + early stopping) …")
         t0 = time.time()

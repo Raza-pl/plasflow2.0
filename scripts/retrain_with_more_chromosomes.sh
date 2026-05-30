@@ -140,7 +140,7 @@ python scripts/train_model.py \
     --labels data/labels.npy \
     --mlp \
     --epochs 50 \
-    --output "$MODEL_OUT"
+    --out "$MODEL_OUT"
 
 echo ""
 echo "============================================================"

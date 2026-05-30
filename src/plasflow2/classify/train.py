@@ -198,9 +198,12 @@ def train_mlp(
     device = get_device()
     model = PlasFlowMLP(input_dim=X_train.shape[1]).to(device)
 
-    X_t = torch.tensor(X_train).float()
-    y_t = torch.tensor(y_train).long()
-    X_v = torch.tensor(X_val).float().to(device)
+    # Use from_numpy to share memory with the numpy arrays (no copy).
+    # This avoids temporarily holding 2× the training data in RAM, which
+    # causes macOS to hit memory pressure and segfault on large datasets.
+    X_t = torch.from_numpy(X_train)   # float32 already — no .float() needed
+    y_t = torch.from_numpy(y_train)   # int64 already — no .long() needed
+    X_v = torch.from_numpy(X_val).to(device)
     # y_val (numpy) is used for accuracy_score; X_v is the device tensor for inference
 
     # num_workers=0 required for MPS (fork-based multiprocessing not supported)
