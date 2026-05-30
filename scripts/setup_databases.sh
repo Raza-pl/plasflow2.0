@@ -66,26 +66,19 @@ install_tool() {
     fi
 }
 
-# ── Helper: download with progress (optional extra flags forwarded to curl) ───
+# ── Helper: download with progress ───────────────────────────────────────────
 download() {
     local url="$1"
     local dest="$2"
-    shift 2
-    local extra_flags=("$@")   # e.g. --insecure
     if [[ -f "$dest" ]]; then
         ok "Already downloaded: $(basename "$dest")"
         return 0
     fi
     echo "  Downloading $(basename "$dest")..."
     if command -v wget &>/dev/null; then
-        # map --insecure → --no-check-certificate for wget
-        local wget_flags=()
-        for f in "${extra_flags[@]}"; do
-            [[ "$f" == "--insecure" ]] && wget_flags+=("--no-check-certificate") || wget_flags+=("$f")
-        done
-        wget -q --show-progress "${wget_flags[@]}" -O "$dest" "$url"
+        wget -q --show-progress -O "$dest" "$url"
     else
-        curl -L --progress-bar "${extra_flags[@]}" -o "$dest" "$url"
+        curl -L --progress-bar -o "$dest" "$url"
     fi
 }
 
@@ -169,90 +162,74 @@ else
 fi
 echo ""
 
-# ── 4. ISfinder (MGE / IS elements) ──────────────────────────────────────────
-echo "─── ISfinder (MGE / IS elements) ────────────────────────────"
+# ── 4. MGE database (Pärnänen et al. 2018 — GitHub, no SSL issues) ───────────
+echo "─── MGE database (IS elements + integrons + transposons) ────"
 MGE_DIR="$DB_DIR/mge"
-ISFINDER_FASTA="$MGE_DIR/ISfinder-sequences.fasta"
-ISFINDER_DMND="$MGE_DIR/isfinder.dmnd"
+MGE_NT_FASTA="$MGE_DIR/MGEs_FINAL_99perc_trim.fasta"
+MGE_AA_FASTA="$MGE_DIR/mge_proteins.faa"
+MGE_DMND="$MGE_DIR/isfinder.dmnd"   # keep filename so --mge-db path stays valid
 mkdir -p "$MGE_DIR"
 
-if [[ -f "$ISFINDER_DMND" ]]; then
-    ok "ISfinder DIAMOND database already exists: $ISFINDER_DMND"
+if [[ -f "$MGE_DMND" ]]; then
+    ok "MGE DIAMOND database already exists: $MGE_DMND"
 else
-    # ISfinder has a broken SSL cert — use --insecure to bypass it.
-    # The file content is legitimate; the cert is just self-signed/expired.
-    isfinder_ok=false
+    # Pärnänen et al. 2018 MGE database — direct GitHub download, no SSL issues.
+    # Contains IS*, ISCR*, intI (integrons), tniA/B (Tn transposons) from NCBI.
+    # ~2000 unique CDS sequences, 99% identity clustered.
+    # Paper: Pärnänen et al. Nature Communications 2018;9:3891
+    MGE_TGZ="$MGE_DIR/MGEs_FINAL_99perc_trim.fasta.tar.gz"
+    MGE_URL="https://github.com/KatariinaParnanen/MobileGeneticElementDatabase/raw/master/MGEs_FINAL_99perc_trim.fasta.tar.gz"
 
-    # Source 1: ISfinder official (broken SSL — use --insecure)
-    echo "  Trying ISfinder official site (--insecure for SSL bypass)..."
-    download "https://isfinder.biotoul.fr/download/ISfinder-sequences.fasta" \
-             "$ISFINDER_FASTA" --insecure && \
-        grep -q "^>" "$ISFINDER_FASTA" 2>/dev/null && isfinder_ok=true || true
+    download "$MGE_URL" "$MGE_TGZ"
 
-    # Source 2: Zenodo archive of ISfinder v21 proteins
-    if ! $isfinder_ok; then
-        rm -f "$ISFINDER_FASTA"
-        warn "Official site failed — trying Zenodo archive..."
-        download "https://zenodo.org/record/7556006/files/ISfinder-sequences.fasta" \
-                 "$ISFINDER_FASTA" && \
-            grep -q "^>" "$ISFINDER_FASTA" 2>/dev/null && isfinder_ok=true || true
+    if [[ ! -f "$MGE_NT_FASTA" ]]; then
+        echo "  Extracting archive..."
+        tar -xzf "$MGE_TGZ" -C "$MGE_DIR"
+        # Rename if extracted with slightly different name
+        find "$MGE_DIR" -name "MGEs_FINAL*.fasta" ! -name "mge_proteins.faa" \
+             -exec mv {} "$MGE_NT_FASTA" \; 2>/dev/null || true
     fi
 
-    # Source 3: ISfinder sequences via NCBI Entrez (small Python fallback)
-    if ! $isfinder_ok; then
-        rm -f "$ISFINDER_FASTA"
-        warn "Zenodo failed — fetching IS element proteins from NCBI..."
-        python3 - "$ISFINDER_FASTA" <<'PYEOF'
-import sys, time, urllib.request, json
-out = sys.argv[1]
-# Search NCBI protein for ISfinder transposases
-# Query: transposase[Title] AND "IS element"[Title] with reasonable size
-base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
-search_url = (f"{base}/esearch.fcgi?db=protein&term=transposase[Title]+"
-              "AND+insertion+sequence[Title]&retmax=5000&retmode=json&usehistory=y")
-with urllib.request.urlopen(search_url) as r:
-    data = json.loads(r.read())
-webenv = data["esearchresult"]["webenv"]
-query_key = data["esearchresult"]["querykey"]
-count = int(data["esearchresult"]["count"])
-print(f"  Found {count} transposase entries on NCBI")
+    if [[ ! -f "$MGE_NT_FASTA" ]]; then
+        err "MGE FASTA extraction failed — check $MGE_TGZ"
+        exit 1
+    fi
+
+    NT_COUNT=$(grep -c "^>" "$MGE_NT_FASTA")
+    echo "  Nucleotide CDS sequences: $NT_COUNT"
+
+    # Translate CDS → protein with biopython, then build DIAMOND database
+    echo "  Translating CDS to protein..."
+    python3 - "$MGE_NT_FASTA" "$MGE_AA_FASTA" <<'PYEOF'
+import sys
+from Bio import SeqIO
+from Bio.Seq import Seq
+
+in_fa, out_fa = sys.argv[1], sys.argv[2]
 written = 0
-batch = 500
-with open(out, "w") as fh:
-    for start in range(0, min(count, 5000), batch):
-        fetch_url = (f"{base}/efetch.fcgi?db=protein&query_key={query_key}"
-                     f"&WebEnv={webenv}&retstart={start}&retmax={batch}"
-                     f"&rettype=fasta&retmode=text")
-        with urllib.request.urlopen(fetch_url) as r:
-            chunk = r.read().decode()
-        fh.write(chunk)
-        written += chunk.count(">")
-        print(f"  Fetched {written} sequences...", end="\r")
-        time.sleep(0.35)
-print(f"\n  Wrote {written} transposase sequences to {out}")
+with open(out_fa, "w") as fh:
+    for rec in SeqIO.parse(in_fa, "fasta"):
+        nt = str(rec.seq).upper().replace("-", "N")
+        # Pad to multiple of 3
+        if len(nt) % 3:
+            nt += "N" * (3 - len(nt) % 3)
+        aa = str(Seq(nt).translate(to_stop=True))
+        if len(aa) >= 30:          # skip very short/truncated ORFs
+            fh.write(f">{rec.id} {rec.description[len(rec.id):].strip()}\n{aa}\n")
+            written += 1
+print(f"  Translated {written} proteins → {out_fa}")
 PYEOF
-        grep -q "^>" "$ISFINDER_FASTA" 2>/dev/null && isfinder_ok=true || true
-    fi
 
-    if $isfinder_ok; then
-        echo "  Validating FASTA..."
-        NSEQS=$(grep -c "^>" "$ISFINDER_FASTA")
-        echo "  Sequences: $NSEQS"
-        echo "  Building DIAMOND database for ISfinder..."
-        diamond makedb \
-            --in "$ISFINDER_FASTA" \
-            --db "$MGE_DIR/isfinder" \
-            --threads "$THREADS" \
-            --quiet
-        ok "ISfinder database built: $ISFINDER_DMND  ($NSEQS sequences)"
-    else
-        err "All ISfinder download sources failed."
-        warn "Manual fix:"
-        warn "  1. Open https://isfinder.biotoul.fr/download.php in your browser"
-        warn "  2. Download the protein FASTA file"
-        warn "  3. cp ~/Downloads/ISfinder-sequences.fasta $ISFINDER_FASTA"
-        warn "  4. diamond makedb --in $ISFINDER_FASTA --db $MGE_DIR/isfinder --threads $THREADS"
-    fi
+    AA_COUNT=$(grep -c "^>" "$MGE_AA_FASTA")
+    echo "  Protein sequences: $AA_COUNT"
+
+    echo "  Building DIAMOND database..."
+    diamond makedb \
+        --in "$MGE_AA_FASTA" \
+        --db "$MGE_DIR/isfinder" \
+        --threads "$THREADS" \
+        --quiet
+    ok "MGE database built: $MGE_DMND  ($AA_COUNT proteins, from $NT_COUNT CDS)"
 fi
 echo ""
 

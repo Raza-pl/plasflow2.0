@@ -1,10 +1,11 @@
-"""Mobile Genetic Element (MGE) detection via DIAMOND + ISfinder protein database.
+"""Mobile Genetic Element (MGE) detection via DIAMOND + MGE protein database.
 
 Detects:
   - Insertion sequences (IS elements) — single-module transposons with one or
     two transposase ORFs; the most common MGEs on plasmids.
   - Composite transposons — flanked by IS elements carrying cargo genes.
   - Complex transposons — e.g. Tn3 family with resolvase + transposase.
+  - Integrons — intI1/intI2 integrase genes; important AMR gene mobilisers.
 
 Pipeline:
     plasmid FASTA → call_orfs() → proteins.faa
@@ -12,22 +13,22 @@ Pipeline:
                   → parse_mge_hits() → [MGEHit]
 
 Database setup (one-time, handled by scripts/setup_databases.sh):
-    # ISfinder protein sequences (transposases):
-    wget https://isfinder.biotoul.fr/download/ISfinder-sequences.fasta
-    diamond makedb --in ISfinder-sequences.fasta -d data/databases/mge/isfinder
+    # Pärnänen et al. 2018 MGE database — IS*, integrons, transposons from NCBI
+    # CDS translated to protein, then DIAMOND database built:
+    diamond makedb --in data/databases/mge/mge_proteins.faa \\
+                   -d data/databases/mge/isfinder
 
-ISfinder header format:
-    >ISAba1_Acinetobacter baumannii AYE ISAba1 transposase partial
-    >ISSoc5 IS5 family transposase ISSOc5
-    General pattern: >{IS_name} {description}
+Database: Pärnänen et al. (2018) Nature Communications 9:3891
+    https://github.com/KatariinaParnanen/MobileGeneticElementDatabase
+    - ~2,000 unique MGE CDS sequences (99% identity clustered)
+    - Covers IS*, ISCR*, intI1/intI2 (integrons), tniA/B, tnpA (transposons),
+      qacEdelta (quaternary ammonium resistance cassettes), Tn916-family ORFs
+    - Sourced from NCBI nucleotide database annotations
 
-Why ISfinder?
-  - Curated, manually annotated IS element database (>6000 entries).
-  - Covers all major IS families (IS1, IS3, IS4, IS5, IS6, IS21, IS26, IS30,
-    IS66, IS91, IS110, IS200/IS605, IS256, IS630, IS701, IS1380, IS1595,
-    IS1634, Tn3 family, etc.).
-  - Free to download and use.
-  - Transposases are highly conserved at protein level → DIAMOND blastp works well.
+Header format (NCBI-style gene name + accession):
+    >IS1_1 gb|AAA62386.1| IS1 transposase [Escherichia coli]
+    >intI1_1 gb|AAB59737.1| integron integrase IntI1 [E. coli]
+    General pattern: >{gene_name}_{n} {description}
 """
 
 from __future__ import annotations
@@ -50,15 +51,11 @@ logger = logging.getLogger(__name__)
 MGE_MIN_IDENTITY = 70.0
 MGE_MIN_COVERAGE = 80.0
 
-# IS family inference from name (covers the most common IS families)
+# IS family inference — covers ISfinder names AND Pärnänen NCBI gene names
 _IS_FAMILY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"\bIS1\b", re.I), "IS1"),
-    (re.compile(r"\bIS3\b", re.I), "IS3"),
-    (re.compile(r"\bIS4\b", re.I), "IS4"),
-    (re.compile(r"\bIS5\b", re.I), "IS5"),
-    (re.compile(r"\bIS6\b", re.I), "IS6"),
-    (re.compile(r"\bIS21\b", re.I), "IS21"),
+    # Specific IS families (check before generic IS prefix)
     (re.compile(r"\bIS26\b", re.I), "IS26"),
+    (re.compile(r"\bIS21\b", re.I), "IS21"),
     (re.compile(r"\bIS30\b", re.I), "IS30"),
     (re.compile(r"\bIS66\b", re.I), "IS66"),
     (re.compile(r"\bIS91\b", re.I), "IS91"),
@@ -66,23 +63,41 @@ _IS_FAMILY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bIS200\b|\bIS605\b", re.I), "IS200/IS605"),
     (re.compile(r"\bIS256\b", re.I), "IS256"),
     (re.compile(r"\bIS630\b", re.I), "IS630"),
+    (re.compile(r"\bISCR\b", re.I), "ISCR"),
+    (re.compile(r"\bIS1\b", re.I), "IS1"),
+    (re.compile(r"\bIS3\b", re.I), "IS3"),
+    (re.compile(r"\bIS4\b", re.I), "IS4"),
+    (re.compile(r"\bIS5\b", re.I), "IS5"),
+    (re.compile(r"\bIS6\b", re.I), "IS6"),
+    # Transposons
     (re.compile(r"\bTn3\b|\bTn903\b|\bTn1000\b", re.I), "Tn3"),
-    (re.compile(r"\bTn10\b|\bTn5\b|\bTn7\b", re.I), "Complex Tn"),
-    (re.compile(r"\bintegron\b|\bintI\b", re.I), "Integron"),
+    (re.compile(r"\bTn10\b|\bTn5\b|\bTn7\b|\bTn916\b", re.I), "Complex Tn"),
+    (re.compile(r"\btniA\b|\btniB\b|\btnpA\b|\btnpR\b", re.I), "Transposon"),
+    # Integrons (intI1/intI2 integrase, istA/istB cassette genes)
+    (re.compile(r"\bintegron\b|\bintI\b|\bintI1\b|\bintI2\b", re.I), "Integron"),
+    (re.compile(r"\bistA\b|\bistB\b", re.I), "Integron"),
+    # Other MGE types
+    (re.compile(r"\bqacE\b|\bqacEdelta\b", re.I), "qacE/Integron"),
     (re.compile(r"\bMITE\b", re.I), "MITE"),
 ]
 
 
 def _infer_is_family(name: str, description: str) -> str:
-    """Infer the IS family from the IS name and description."""
-    text = f"{name} {description}"
+    """Infer the IS/MGE family from element name and description.
+
+    Handles both ISfinder-style names (ISAba1, IS26) and Pärnänen database
+    NCBI-style gene names (intI1_1, tniA_5, IS1_3).
+    """
+    # Strip trailing _<number> suffix common in Pärnänen headers (e.g. "IS1_3" → "IS1")
+    clean_name = re.sub(r"_\d+$", "", name)
+    text = f"{clean_name} {description}"
     for pattern, family in _IS_FAMILY_PATTERNS:
         if pattern.search(text):
             return family
-    # Fallback: extract IS family from name prefix (e.g. ISAba1 → IS)
-    m = re.match(r"^IS([A-Za-z0-9]+)", name)
+    # Generic IS prefix fallback (e.g. ISAba1 → "ISAba", ISSoc5 → "ISSoc")
+    m = re.match(r"^IS([A-Za-z0-9]{1,4})", clean_name, re.I)
     if m:
-        return f"IS{m.group(1)[:4]}"  # truncate to avoid very long labels
+        return f"IS{m.group(1)}"
     return "Unknown"
 
 
