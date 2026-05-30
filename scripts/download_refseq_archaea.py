@@ -1,54 +1,26 @@
 #!/usr/bin/env python3
-"""Download diverse RefSeq complete archaeal genomes for MLP classifier training.
+"""Download diverse RefSeq archaeal genomes for MLP classifier training.
 
-Why archaea matter in PlasFlow v2
-----------------------------------
+Why archaea matter
+------------------
 The MLP has 4 output classes: plasmid / chromosome / phage / archaea.
-Currently the archaea class has ZERO training sequences, so:
-  - The class always predicts with near-zero probability.
-  - Archaeal contigs get misclassified as chromosome (closest k-mer profile)
-    or left as unclassified, which inflates chromosome counts.
+Without archaeal training data the class scores near-zero probability,
+and archaeal contigs get misclassified as chromosome or unclassified.
 
-Adding archaeal training data allows the model to:
-  1. Correctly identify archaeal contigs (prevents false positives in the
-     chromosome / phage classes).
-  2. Suppress archaea from AMR annotation (archaea don't carry clinically
-     relevant resistance genes — skipping them is intentional).
+WWTP metagenomes have significant archaeal communities:
+  - Methanogens (Methanosaeta, Methanosarcina): 15-30% of biomass in digesters
+  - Ammonia-oxidising archaea (Nitrososphaera): 5-15% in aerobic tanks
+  - Crenarchaeota, Halobacteria in sediment/biofilm
 
-Archaea in environmental metagenomes
--------------------------------------
-WWTP (wastewater treatment plants) — the primary PlasFlow v2 use case — have
-significant archaeal communities:
-  - Anaerobic digesters:  methanogens (Methanosaeta, Methanobacterium,
-    Methanosarcina) often represent 15–30 % of microbial biomass.
-  - Aerobic tanks:        Thaumarchaeota (ammonia-oxidising archaea like
-    Nitrososphaera) can reach 5–15 %.
-  - Sediment/biofilm:    Crenarchaeota, Halobacteria in high-salinity WW.
-
-Without archaeal training data, these abundant sequences pollute the
-chromosome class and reduce the model's effective accuracy on the non-archaea
-classes.
-
-Archaeal phyla and target counts (default --count 500)
---------------------------------------------------------
-    Euryarchaeota      200  — methanogens, halophiles (most WWTP-relevant)
-    Thermoprotei       100  — Crenarchaeota / hyperthermophiles
-    Thaumarchaeota      80  — ammonia-oxidising archaea (WWTP nitrification)
-    Asgard archaea      50  — recently discovered, diverse
-    Nanoarchaeota       30  — ultra-small symbiotic archaea
-    DPANN group         40  — diverse, tiny genomes
-
-Disk space: ~2 MB/genome (archaea have smaller genomes than bacteria) × 500
-            = ~1 GB.
+Approach
+--------
+Uses the NCBI FTP assembly_summary.txt — the same approach that successfully
+downloaded 1998 bacterial chromosomes.  The old Entrez API approach returned
+0 results because NCBI changed their API.
 
 Usage:
-    python scripts/download_refseq_archaea.py \\
-        --out-dir data/databases/archaea \\
-        --count 500
-
-    # Then add to build_dataset.py:
-    archaea_dir = Path("data/databases/archaea")
-    # load_windowed_streaming handles it identically to chromosome sequences
+    python scripts/download_refseq_archaea.py --outdir data/databases/archaea
+    python scripts/download_refseq_archaea.py --outdir data/databases/archaea --count 300
 """
 
 from __future__ import annotations
@@ -61,195 +33,188 @@ import time
 import urllib.request
 from pathlib import Path
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# NCBI taxonomy IDs for archaeal phyla / groups
-ARCHAEA_TAXIDS: dict[str, tuple[int, int]] = {
-    # (NCBI taxonomy ID for phylum/class, target count)
-    "Euryarchaeota": (28890, 200),
-    "Crenarchaeota": (28889, 100),
-    "Thaumarchaeota": (651137, 80),
-    "Asgard_archaea": (1935183, 50),
-    "Nanoarchaeota": (192989, 30),
-    "DPANN": (1783276, 40),
-}
+# NCBI FTP assembly summary for archaea (RefSeq)
+ASSEMBLY_SUMMARY_URL = (
+    "https://ftp.ncbi.nlm.nih.gov/genomes/refseq/archaea/assembly_summary.txt"
+)
+
+# Cap per genus to avoid over-representation
+MAX_PER_GENUS = 10
 
 
-def _fetch_assembly_list(taxid: int, max_results: int = 500) -> list[dict[str, str]]:
-    """Query NCBI Datasets API for RefSeq complete archaeal assemblies."""
-    import json
-    import urllib.error
+def _fetch_assembly_summary(url: str) -> list[dict]:
+    """Download and parse NCBI FTP assembly_summary.txt for archaea."""
+    logger.info("Fetching assembly summary from %s …", url)
+    req = urllib.request.Request(url, headers={"User-Agent": "PlasFlow2/1.0"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
 
-    url = (
-        f"https://api.ncbi.nlm.nih.gov/datasets/v2alpha/genome/taxon/{taxid}/dataset_report"
-        f"?filters.assembly_source=refseq"
-        f"&filters.assembly_level=complete_genome"
-        f"&filters.exclude_atypical=true"
-        f"&page_size={min(max_results, 1000)}"
-        f"&returned_content=ASSEMBLIES"
+    lines = raw.splitlines()
+
+    # First line is a README comment, second line is the actual header (starts with #)
+    header_line = next(
+        (line for line in lines if line.startswith("#") and "assembly_accession" in line),
+        None,
     )
-    try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            data = json.loads(resp.read())
-    except (urllib.error.URLError, json.JSONDecodeError) as exc:
-        logger.warning("NCBI API call failed for taxid %d: %s", taxid, exc)
-        return []
+    if header_line is None:
+        raise RuntimeError("Could not find header line in assembly_summary.txt")
 
-    assemblies = []
-    for report in data.get("reports", []):
-        acc = report.get("accession", "")
-        name = report.get("organism", {}).get("organism_name", "Unknown")
-        ftp = report.get("assembly_info", {}).get("ftp_path_genbank", "") or report.get(
-            "assembly_info", {}
-        ).get("ftp_path", "")
-        if acc and ftp:
-            assemblies.append({"accession": acc, "name": name, "ftp": ftp})
-    return assemblies
+    cols = header_line.lstrip("#").strip().split("\t")
+    records = []
+    for line in lines:
+        if line.startswith("#") or not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < len(cols):
+            continue
+        rec = dict(zip(cols, parts))
+        records.append(rec)
 
-
-def _ftp_download(ftp_path: str, dest: Path) -> bool:
-    """Download the genomic FASTA from an NCBI FTP path. Returns True on success."""
-    # ftp_path looks like: https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/.../
-    if not ftp_path:
-        return False
-    ftp_path = ftp_path.rstrip("/")
-    basename = ftp_path.split("/")[-1]
-    url = f"{ftp_path}/{basename}_genomic.fna.gz"
-    try:
-        logger.debug("Downloading %s", url)
-        urllib.request.urlretrieve(url, str(dest))
-        return True
-    except Exception as exc:
-        logger.warning("Download failed for %s: %s", url, exc)
-        return False
+    logger.info("Parsed %d assembly records", len(records))
+    return records
 
 
-def download_archaea(
-    out_dir: Path,
-    total_count: int = 500,
-    api_key: str | None = None,
-    seed: int = 42,
-) -> None:
-    """Download archaeal genomes from RefSeq, distributed across phyla.
+def _select_genomes(records: list[dict], total_count: int, seed: int) -> list[dict]:
+    """Filter to complete/chromosome-level genomes, deduplicate by species, cap per genus."""
+    # Keep only complete or chromosome-level assemblies with valid FTP paths
+    filtered = [
+        r for r in records
+        if r.get("assembly_level") in ("Complete Genome", "Chromosome")
+        and r.get("ftp_path", "na") not in ("na", "", "NA")
+    ]
+    logger.info("%d complete/chromosome-level archaeal assemblies available", len(filtered))
 
-    Args:
-        out_dir: Directory to write downloaded FASTA files.
-        total_count: Total number of genomes to download.
-        api_key: NCBI API key (optional, increases rate limit from 3 to 10 req/s).
-        seed: Random seed for reproducible sampling.
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
     rng = random.Random(seed)
+    rng.shuffle(filtered)
 
-    # Apportion targets proportionally across phyla
-    total_weights = sum(v[1] for v in ARCHAEA_TAXIDS.values())
-    targets: dict[str, int] = {
-        name: max(1, round(total_count * count / total_weights))
-        for name, (_, count) in ARCHAEA_TAXIDS.items()
-    }
-    # Adjust rounding errors
-    diff = total_count - sum(targets.values())
-    if diff:
-        largest = max(targets, key=targets.get)  # type: ignore[arg-type]
-        targets[largest] += diff
+    # Deduplicate: one genome per species_taxid, cap MAX_PER_GENUS per organism_name prefix
+    seen_species: set[str] = set()
+    genus_count: dict[str, int] = {}
+    selected: list[dict] = []
 
-    logger.info("Download targets: %s", targets)
-    downloaded = 0
-
-    for phylum, (taxid, _) in ARCHAEA_TAXIDS.items():
-        want = targets[phylum]
-        logger.info("Fetching assembly list for %s (taxid=%d, want=%d) …", phylum, taxid, want)
-        assemblies = _fetch_assembly_list(taxid, max_results=want * 3)
-        if not assemblies:
-            logger.warning("No assemblies found for %s — skipping", phylum)
+    for rec in filtered:
+        species_taxid = rec.get("species_taxid", "")
+        if species_taxid in seen_species:
             continue
 
-        rng.shuffle(assemblies)
-        got = 0
-        for asm in assemblies:
-            if got >= want:
-                break
-            acc = asm["accession"]
-            dest_gz = out_dir / f"{acc}_genomic.fna.gz"
-            dest_fa = out_dir / f"{acc}_genomic.fna"
+        genus = rec.get("organism_name", "Unknown").split()[0]
+        if genus_count.get(genus, 0) >= MAX_PER_GENUS:
+            continue
 
-            if dest_fa.exists():
-                logger.info("  [skip] %s already exists", acc)
-                got += 1
-                downloaded += 1
-                continue
+        seen_species.add(species_taxid)
+        genus_count[genus] = genus_count.get(genus, 0) + 1
+        selected.append(rec)
 
-            if _ftp_download(asm["ftp"], dest_gz):
-                # Decompress
-                try:
-                    with gzip.open(dest_gz, "rb") as gz_in, open(dest_fa, "wb") as fa_out:
-                        fa_out.write(gz_in.read())
-                    dest_gz.unlink()
-                    logger.info("  [%3d] %-40s  %s", downloaded + 1, asm["name"][:40], acc)
-                    got += 1
-                    downloaded += 1
-                except Exception as exc:
-                    logger.warning("  Decompress failed for %s: %s", acc, exc)
-                    dest_gz.unlink(missing_ok=True)
+        if len(selected) >= total_count:
+            break
 
-            # NCBI rate limiting
-            time.sleep(0.35 if api_key else 1.0)
+    logger.info("Selected %d genomes after deduplication (max %d per genus)", len(selected), MAX_PER_GENUS)
+    return selected
 
-        logger.info("  %s: downloaded %d / %d", phylum, got, want)
 
-    logger.info("Total archaeal genomes downloaded: %d / %d", downloaded, total_count)
-    logger.info("Output directory: %s", out_dir)
+def _download_genome(rec: dict, outdir: Path) -> bool:
+    """Download a single genome FASTA from NCBI FTP. Returns True on success."""
+    acc = rec["assembly_accession"]
+    ftp_path = rec["ftp_path"].rstrip("/")
+    asm_name = rec.get("asm_name", "asm").replace(" ", "_")
+    filename = f"{acc}_{asm_name}_genomic.fna.gz"
+    url = f"{ftp_path}/{filename}".replace("ftp://", "https://")
 
-    # Print next steps
-    print("\nNext steps:")
-    print("  1. Add archaea sequences to build_dataset.py:")
-    print(f"     archaea_dir = Path('{out_dir}')")
-    print("     archaea_files = list(archaea_dir.glob('*.fna'))")
-    print("     archaea_seqs = load_windowed_streaming(archaea_files, label='archaea', ...)")
-    print("  2. Rebuild the dataset and retrain:")
-    print("     python scripts/build_dataset.py \\")
-    print("       --plasmid-dir data/databases/PlasmidScope \\")
-    print(f"       --archaea-dir {out_dir} \\")
-    print("       --output data/datasets/training_v3.npz")
-    print("  3. python -m plasflow2.classify.train --dataset data/datasets/training_v3.npz")
+    dest_fa = outdir / f"{acc}_genomic.fna"
+    if dest_fa.exists():
+        return True  # already downloaded
+
+    dest_gz = outdir / f"{acc}_genomic.fna.gz"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "PlasFlow2/1.0"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            dest_gz.write_bytes(resp.read())
+
+        with gzip.open(dest_gz, "rb") as gz_in, open(dest_fa, "wb") as fa_out:
+            fa_out.write(gz_in.read())
+        dest_gz.unlink()
+        return True
+
+    except Exception as exc:
+        logger.warning("  Failed %s: %s", acc, exc)
+        dest_gz.unlink(missing_ok=True)
+        return False
+
+
+def download_archaea(outdir: Path, total_count: int = 200, seed: int = 42) -> None:
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Check existing
+    existing = list(outdir.glob("*.fna"))
+    logger.info("Found %d existing archaeal genomes in %s", len(existing), outdir)
+
+    if len(existing) >= total_count:
+        logger.info("Already have %d genomes — skipping download", len(existing))
+        return
+
+    records = _fetch_assembly_summary(ASSEMBLY_SUMMARY_URL)
+    targets = _select_genomes(records, total_count, seed)
+
+    need = total_count - len(existing)
+    logger.info("Downloading up to %d more genomes …", need)
+
+    downloaded = len(existing)
+    for i, rec in enumerate(targets):
+        acc = rec["assembly_accession"]
+        dest = outdir / f"{acc}_genomic.fna"
+        if dest.exists():
+            continue
+
+        org = rec.get("organism_name", "")[:50]
+        logger.info("  [%3d/%3d] %s  %s", downloaded + 1, total_count, acc, org)
+
+        if _download_genome(rec, outdir):
+            downloaded += 1
+
+        if downloaded >= total_count:
+            break
+
+        time.sleep(0.4)  # NCBI rate limit
+
+    final = list(outdir.glob("*.fna"))
+    logger.info("Done — %d archaeal genomes in %s", len(final), outdir)
+    print(f"\nDownloaded {len(final)} archaeal genomes to {outdir}/")
+    print("Next step: rebuild the dataset with archaea included:")
+    print(f"  python scripts/build_dataset.py \\")
+    print(f"    --plasmid-dir data/databases/plasmids/ \\")
+    print(f"    --chrom-dir   data/chromosomes/ \\")
+    print(f"    --archaea-dir {outdir} \\")
+    print(f"    --data-dir    data/databases/ \\")
+    print(f"    --max-per-class 95000 \\")
+    print(f"    --out         data/")
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     parser = argparse.ArgumentParser(
         description="Download RefSeq archaeal genomes for PlasFlow v2 training."
     )
     parser.add_argument(
-        "--out-dir",
+        "--outdir",
         default="data/databases/archaea",
-        help="Output directory for downloaded FASTA files (default: data/databases/archaea).",
+        help="Output directory for FASTA files (default: data/databases/archaea)",
     )
     parser.add_argument(
         "--count",
         type=int,
-        default=500,
-        help="Total number of archaeal genomes to download (default: 500).",
-    )
-    parser.add_argument(
-        "--api-key",
-        default=None,
-        help="NCBI API key for higher rate limits (optional). "
-        "Register at: https://www.ncbi.nlm.nih.gov/account/",
+        default=200,
+        help="Number of archaeal genomes to download (default: 200)",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="Random seed for reproducible sampling (default: 42).",
+        help="Random seed for reproducible sampling (default: 42)",
     )
     args = parser.parse_args()
-
-    download_archaea(
-        out_dir=Path(args.out_dir),
-        total_count=args.count,
-        api_key=args.api_key,
-        seed=args.seed,
-    )
+    download_archaea(Path(args.outdir), total_count=args.count, seed=args.seed)
 
 
 if __name__ == "__main__":

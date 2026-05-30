@@ -620,6 +620,18 @@ def main() -> None:
             "(majority-label approximation)."
         ),
     )
+    parser.add_argument(
+        "--archaea-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Directory of per-assembly archaeal FASTA files "
+            "(output of download_refseq_archaea.py). "
+            "Sequences are tiled into contig-sized windows. "
+            "Without this, the archaea class has zero training examples."
+        ),
+    )
 
     # ── Legacy single-directory option ──────────────────────────────────────
     parser.add_argument(
@@ -863,19 +875,46 @@ def main() -> None:
     all_labels.extend(chrom_labels)
     source_stats["chromosome"] = len(chrom_seqs)
 
-    # ── Archaea (optional stub) ───────────────────────────────────────────────
-    archaea_path = data_dir / "archaea.fna"
-    if archaea_path.exists():
-        logger.info("=" * 60)
-        logger.info("ARCHAEA CLASS")
-        logger.info("=" * 60)
-        seqs, ids, labels = load_and_subsample(
-            archaea_path, "archaea", args.max_per_class, args.min_length, args.seed
+    # ── Archaea (streaming directory, same approach as chromosomes) ───────────
+    logger.info("=" * 60)
+    logger.info("ARCHAEA CLASS")
+    logger.info("=" * 60)
+
+    archaea_added = 0
+    if args.archaea_dir and args.archaea_dir.is_dir():
+        archaea_files = _fasta_files_in_dir(args.archaea_dir)
+        logger.info("Streaming %d archaeal genome files …", len(archaea_files))
+        seqs, ids, labels = load_windowed_streaming(
+            archaea_files,
+            label="archaea",
+            max_total=args.max_per_class,
+            min_length=args.min_length,
+            seed=args.seed,
         )
         all_seqs.extend(seqs)
         all_ids.extend(ids)
         all_labels.extend(labels)
-        source_stats["archaea"] = len(seqs)
+        archaea_added = len(seqs)
+        logger.info("  Archaea windows: %d", archaea_added)
+    else:
+        # Fall back to legacy single-file stub if present
+        archaea_path = data_dir / "archaea.fna"
+        if archaea_path.exists():
+            seqs, ids, labels = load_and_subsample(
+                archaea_path, "archaea", args.max_per_class, args.min_length, args.seed
+            )
+            all_seqs.extend(seqs)
+            all_ids.extend(ids)
+            all_labels.extend(labels)
+            archaea_added = len(seqs)
+            logger.info("  Archaea windows (legacy stub): %d", archaea_added)
+        else:
+            logger.warning(
+                "No archaea source found. The archaea class will have ZERO training examples.\n"
+                "  Run: python scripts/download_refseq_archaea.py --outdir data/databases/archaea\n"
+                "  Then pass: --archaea-dir data/databases/archaea"
+            )
+    source_stats["archaea"] = archaea_added
 
     # ── Validation ────────────────────────────────────────────────────────────
     if not all_seqs:
