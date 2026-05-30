@@ -82,20 +82,26 @@ def fetch_assembly_summary() -> list[dict]:
         raw = resp.read().decode("utf-8")
 
     lines = raw.splitlines()
-    # First line is a comment starting with '#', second line has column headers
-    # starting with '# assembly_accession' → strip leading '#'
-    header_line = next(line for line in lines if line.startswith("#"))
+    # The file has two comment lines:
+    #   Line 1: "# See ftp://... for a description of the columns..."
+    #   Line 2: "# assembly_accession\tbioproject\t..."  ← actual column headers
+    # We need the line that contains 'assembly_accession', not the first '#' line.
+    header_line = next(
+        line for line in lines if line.startswith("#") and "assembly_accession" in line
+    )
     header = header_line.lstrip("# ").split("\t")
     data_lines = [line for line in lines if line and not line.startswith("#")]
+
+    logger.info("Columns: %s", header[:6])  # sanity-check first 6 column names
+    logger.info("Data rows (all assembly levels): %d", len(data_lines))
 
     reader = csv.DictReader(data_lines, fieldnames=header, delimiter="\t")
     rows = []
     for row in reader:
-        if (
-            row.get("assembly_level") == "Complete Genome"
-            and row.get("version_status", "").lower() == "latest"
-            and row.get("ftp_path", "na") not in ("na", "")
-        ):
+        level = row.get("assembly_level", "")
+        status = row.get("version_status", "").lower()
+        ftp = row.get("ftp_path", "na")
+        if level == "Complete Genome" and status == "latest" and ftp not in ("na", ""):
             rows.append(row)
 
     logger.info("Complete Genome assemblies (latest): %d", len(rows))
