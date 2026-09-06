@@ -6,6 +6,10 @@ All notable MobiOrigin changes are documented here. The project uses semantic ve
 
 ### Changed
 
+- Made all DIAMOND annotation-result readers tolerate isolated legacy bytes in
+  third-party free-text descriptions. Valid evidence rows are retained with
+  only undecodable title characters replaced, preventing a completed
+  multi-database annotation run from failing during result parsing.
 - Removed an unused internal instruction file from the public repository.
 - Generalized the local build-artifact exclusion and operational script root so
   public files no longer expose development-environment names or a private

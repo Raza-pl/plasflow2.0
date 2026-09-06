@@ -183,7 +183,11 @@ def run_evidence_diamond(
 
 def _rows(path: Path) -> list[tuple[str, str, float, float, float, float, str]]:
     values: list[tuple[str, str, float, float, float, float, str]] = []
-    with path.open(encoding="utf-8") as handle:
+    # DIAMOND title fields originate in third-party database headers and can
+    # contain isolated legacy bytes.  They are descriptive text, so replacing
+    # undecodable characters is safer than discarding valid evidence rows or
+    # failing the entire sample.
+    with path.open(encoding="utf-8", errors="replace") as handle:
         for line_number, raw in enumerate(handle, start=1):
             if not raw.strip():
                 continue
