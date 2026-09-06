@@ -154,7 +154,11 @@ def run_arg_diamond(
 
 
 def _diamond_rows(path: Path) -> Iterable[tuple[str, str, float, float, float, float, str]]:
-    with path.open(encoding="utf-8") as handle:
+    # Third-party database descriptions occasionally contain legacy bytes
+    # (for example, a Windows-1252 non-breaking space).  DIAMOND copies those
+    # bytes into the free-text title column.  Preserve the evidence row and
+    # replace only undecodable text instead of aborting the complete analysis.
+    with path.open(encoding="utf-8", errors="replace") as handle:
         for line_number, raw in enumerate(handle, start=1):
             if not raw.strip():
                 continue

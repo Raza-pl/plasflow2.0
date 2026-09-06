@@ -18,6 +18,7 @@ from mobiorigin import cli, model_setup, runtime
 from mobiorigin.annotate import (
     ArgHit,
     Orf,
+    _diamond_rows,
     annotate,
     consensus_hits,
     load_amrfinder_hierarchy,
@@ -48,6 +49,9 @@ from mobiorigin.biological_evidence import (
     parse_mobileog,
     write_integrated_results,
     write_publication_summary,
+)
+from mobiorigin.biological_evidence import (
+    _rows as _evidence_rows,
 )
 from mobiorigin.database_setup import (
     DATABASE_FILENAMES,
@@ -1787,6 +1791,21 @@ def test_mobileog_parser_recovers_titles_and_excludes_unresolved_rows(tmp_path: 
     assert warnings[0].query == "seq__orf_2"
     assert warnings[0].subject == "unresolved-id"
     assert warnings[0].reason == "unsupported_mobileog_header_excluded"
+
+
+def test_diamond_parsers_tolerate_legacy_bytes_in_free_text_titles(tmp_path: Path) -> None:
+    result = tmp_path / "diamond.tsv"
+    result.write_bytes(
+        b"seq__orf_1\tBAC0001\t91.5\t87.0\t1e-20\t205.0\t" b"legacy\xa0database description\n"
+    )
+
+    arg_rows = list(_diamond_rows(result))
+    evidence_rows = _evidence_rows(result)
+
+    for rows in (arg_rows, evidence_rows):
+        assert len(rows) == 1
+        assert rows[0][:6] == ("seq__orf_1", "BAC0001", 91.5, 87.0, 1e-20, 205.0)
+        assert rows[0][6] == "legacy\ufffddatabase description"
 
 
 def test_mobileog_source_audit_is_deterministic_and_fail_closed(tmp_path: Path) -> None:
